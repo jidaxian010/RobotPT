@@ -1,0 +1,12 @@
+# data
+*.jsonl
+*.h5
+*.mp4
+*.avi
+*.mov
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.pyc
