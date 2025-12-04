@@ -238,6 +238,37 @@ class SelectMarker:
 
         writer.write(frame)
 
+    def process_data(self, marker_id: Optional[int] = None, corner_idx: int = 0) -> np.ndarray:
+        """
+        Process the video and return pixel coordinates for a specific marker corner.
+        Similar interface to SelectItem.process_data().
+        
+        Args:
+            marker_id: Specific marker ID to track. If None, uses first detected marker.
+            corner_idx: Which corner to track (0-3). Default is 0.
+            
+        Returns:
+            Numpy array of shape (1, 2, T) where 1=one corner, 2=(u,v), T=frames
+        """
+        # Get trajectories for all markers
+        marker_trajectories = self.run()  # Dict[int, np.ndarray(4,2,T)]
+        
+        if not marker_trajectories:
+            raise RuntimeError("No ArUco markers detected in video")
+        
+        # Select marker to track
+        if marker_id is None:
+            marker_id = list(marker_trajectories.keys())[0]
+            print(f"No marker_id specified, using first detected marker: {marker_id}")
+        
+        if marker_id not in marker_trajectories:
+            raise RuntimeError(f"Marker ID {marker_id} not found. Available: {list(marker_trajectories.keys())}")
+        
+        # Extract specific corner trajectory
+        pixel_array = marker_trajectories[marker_id][corner_idx:corner_idx+1, :, :]  # Shape: (1, 2, T)
+        
+        return pixel_array
+
 
 def main():
     # Simple config (adjust as needed)

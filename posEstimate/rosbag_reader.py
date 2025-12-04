@@ -380,9 +380,10 @@ class RosbagReader:
         return estimated_mb
 
 class RosbagVideoReader:
-    def __init__(self, bagpath, out_file, skip_first_n=0, skip_last_n=0):
+    def __init__(self, bagpath, out_file, is_third_person=True, skip_first_n=0, skip_last_n=0):
         self.bagpath = bagpath
         self.out_file = out_file
+        self.is_third_person = is_third_person
         self.skip_first_n = skip_first_n
         self.skip_last_n = skip_last_n
     @staticmethod
@@ -439,8 +440,10 @@ class RosbagVideoReader:
             numpy array of timestamps in seconds (Unix epoch)
         """
         print(f"Reading RGB timestamps from bag: {self.bagpath}")
-        topic_name = "/third_person_cam/camera/camera/color/image_raw"
-        # topic_name = "/left_camera/camera/camera/color/image_raw"
+        if self.is_third_person:
+            topic_name = "/third_person_cam/camera/camera/color/image_raw"
+        else:
+            topic_name = "/left_camera/camera/camera/color/image_raw"
         
         with AnyReader([self.bagpath]) as reader:
             camera_conn = None
@@ -480,12 +483,13 @@ class RosbagVideoReader:
     def process_data(self):
         """
         Read camera images from ROS bag and save as MP4 video.
-        
-        Topic: third_person_cam/camera/camera/color/image_raw
         """
+        
         print(f"Reading video data from bag: {self.bagpath}")
-        topic_name = "/third_person_cam/camera/camera/color/image_raw"
-        # topic_name = "/left_camera/camera/camera/color/image_raw"
+        if self.is_third_person:    
+            topic_name = "/third_person_cam/camera/camera/color/image_raw"
+        else:
+            topic_name = "/left_camera/camera/camera/color/image_raw"
         
         
         # Open the bag file and find the camera topic
@@ -601,8 +605,10 @@ class RosbagVideoReader:
                         frame_idx: frame index (same as input)
         """
         print(f"Finding depth data from bag: {self.bagpath}")
-        topic_name = "/third_person_cam/camera/camera/aligned_depth_to_color/image_raw"
-        # topic_name = "/left_camera/camera/camera/color/image_raw"
+        if self.is_third_person:
+            topic_name = "/third_person_cam/camera/camera/color/image_raw"
+        else:
+            topic_name = "/left_camera/camera/camera/color/image_raw"
         
         
         # Convert to numpy array if not already
@@ -723,8 +729,10 @@ class RosbagVideoReader:
             out_file = out_path.parent / (out_path.stem + '_depth' + out_path.suffix)
         
         print(f"Saving depth video to: {out_file}")
-        topic_name = "/third_person_cam/camera/camera/aligned_depth_to_color/image_raw"
-        # topic_name = "/left_camera/camera/camera/color/image_raw"
+        if self.is_third_person:
+            topic_name = "/third_person_cam/camera/camera/aligned_depth_to_color/image_raw"
+        else:
+            topic_name = "/left_camera/camera/camera/color/image_raw"
         
         
         with AnyReader([self.bagpath]) as reader:
@@ -850,9 +858,9 @@ def main():
     # print("Test imu_left data shape", sensor_data['imu_left'].shape)
 
     # Read RGB
-    bagpath = Path("/home/jdx/Downloads/demo")
-    out_file = Path("posEstimate/data/demo.mp4")
-    Videoreader = RosbagVideoReader(bagpath, out_file, skip_first_n=0, skip_last_n=0)
+    bagpath = Path("/home/jdx/Downloads/color_motion")
+    out_file = Path("posEstimate/data/color_motion.mp4")
+    Videoreader = RosbagVideoReader(bagpath, out_file, is_third_person=True, skip_first_n=0, skip_last_n=0)
     
     Videoreader.process_data()
     Videoreader.save_depth_video()
