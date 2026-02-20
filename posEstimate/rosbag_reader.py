@@ -606,9 +606,9 @@ class RosbagVideoReader:
         """
         print(f"Finding depth data from bag: {self.bagpath}")
         if self.is_third_person:
-            topic_name = "/third_person_cam/camera/camera/color/image_raw"
+            topic_name = "/third_person_cam/camera/camera/aligned_depth_to_color/image_raw"
         else:
-            topic_name = "/left_camera/camera/camera/color/image_raw"
+            topic_name = "/left_camera/camera/camera/aligned_depth_to_color/image_raw"
         
         
         # Convert to numpy array if not already
@@ -858,8 +858,8 @@ def main():
     # print("Test imu_left data shape", sensor_data['imu_left'].shape)
 
     # Read RGB
-    bagpath = Path("/home/jdx/Downloads/color_motion")
-    out_file = Path("posEstimate/data/color_motion.mp4")
+    bagpath = Path("/home/jdx/Downloads/mark")
+    out_file = Path("posEstimate/data/mark.mp4")
     Videoreader = RosbagVideoReader(bagpath, out_file, is_third_person=True, skip_first_n=0, skip_last_n=0)
     
     Videoreader.process_data()

@@ -181,23 +181,24 @@ def main():
     #     print(f"Pixel array shape: {pixel_array.shape}  (N=1 point, 2=(u,v), T=frames)")
     #     print(f"Pixel depth array shape: {pixel_depth_array.shape}")
     #     print(f"Odometry array shape: {odometry_array.shape}")
+    #     print(pixel_depth_array)
     # except Exception as e:
     #     print(f"Manual point selection failed: {e}")
     
-    print("\n=== ArUco Marker Tracking ===")
+    print("\n=== Color Tracking ===")
     try:
         # marker_pixel_array, marker_pixel_depth_array, marker_odometry_array = find_odometry_data(
         #     bagpath, video_path, select_method="marker", corner_idx=0
         # )
         marker_pixel_array, marker_pixel_depth_array, marker_odometry_array = find_odometry_data(
-            bagpath, video_path, select_method="color", color="pink", min_area=10
+            bagpath, video_path, select_method="color", color="green", min_area=10
         )        
-        print(f"Marker pixel array shape: {marker_pixel_array.shape}  (N=1 corner, 2=(u,v), T=frames)")
-        print(f"Marker pixel depth array shape: {marker_pixel_depth_array.shape}")
-        print(f"Marker odometry array shape: {marker_odometry_array.shape}")
+        print(f"Color pixel array shape: {marker_pixel_array.shape}  (N=1 corner, 2=(u,v), T=frames)")
+        print(f"Color pixel depth array shape: {marker_pixel_depth_array.shape}")
+        print(f"Color odometry array shape: {marker_odometry_array.shape}")
         print(marker_pixel_depth_array)
     except Exception as e:
-        print(f"ArUco marker tracking failed: {e}")
+        print(f"Color tracking failed: {e}")
 
 
 
