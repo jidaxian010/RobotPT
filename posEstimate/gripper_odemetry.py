@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+from matplotlib.animation import FuncAnimation, FFMpegWriter
 
 from rosbag_reader import RosbagVideoReader
 from object_detect.select_marker import SelectMarker
@@ -91,21 +91,21 @@ def plot_all_markers_3d(all_odometry):
     plt.show()
 
 
-def save_trajectory_animation(all_odometry, output_path, fps=15, dpi=100):
+def save_trajectory_animation(all_odometry, output_path, rgb_timestamps, dpi=100):
     """
-    Save an animated 3D trajectory of all ArUco markers as a GIF or MP4.
+    Save an animated 3D trajectory of all ArUco markers as an MP4.
 
-    Each frame of the animation corresponds to one video frame index, drawing
-    the trajectory cumulatively so the path grows over time with a dot showing
-    the current position.
+    Playback speed matches the original video: fps is derived from the rosbag
+    RGB timestamps so each animation frame covers exactly the same wall-clock
+    duration as the corresponding video frame.
 
     Args:
-        all_odometry: Dict[int, np.ndarray] mapping marker_id to (M, 4) array
-                      with columns [x, y, z, frame_idx]
-        output_path:  Path to save the animation (".gif" uses Pillow,
-                      ".mp4" uses FFMpeg)
-        fps:          Frames per second of the output animation
-        dpi:          DPI of the rendered figure
+        all_odometry:    Dict[int, np.ndarray] mapping marker_id to (M, 4) array
+                         with columns [x, y, z, frame_idx]
+        output_path:     Path to save the MP4
+        rgb_timestamps:  np.ndarray shape (T,) of per-frame timestamps in
+                         seconds, as returned by RosbagVideoReader.get_rgb_timestamps()
+        dpi:             DPI of the rendered figure
     """
     output_path = Path(output_path)
 
@@ -119,7 +119,14 @@ def save_trajectory_animation(all_odometry, output_path, fps=15, dpi=100):
     all_frame_idxs = np.concatenate([
         odo[:, 3] for odo in all_odometry.values() if len(odo) > 0
     ]).astype(int)
-    frame_range = range(all_frame_idxs.min(), all_frame_idxs.max() + 1)
+    min_fi, max_fi = int(all_frame_idxs.min()), int(all_frame_idxs.max())
+    frame_range = range(min_fi, max_fi + 1)
+
+    # Derive fps from actual rosbag timestamps so playback matches the video
+    n_frames = max_fi - min_fi + 1
+    time_span = float(rgb_timestamps[max_fi] - rgb_timestamps[min_fi])
+    fps = n_frames / time_span if time_span > 0 else 30.0
+    interval_ms = 1000.0 / fps
 
     # Build per-marker lookup: frame_idx -> (x, y, z)
     marker_ids = sorted(all_odometry.keys())
@@ -184,14 +191,11 @@ def save_trajectory_animation(all_odometry, output_path, fps=15, dpi=100):
 
     anim = FuncAnimation(
         fig, update, frames=frame_range,
-        interval=1000 / fps, blit=False,
+        interval=interval_ms, blit=False,
     )
 
-    if output_path.suffix.lower() == ".gif":
-        writer = PillowWriter(fps=fps)
-    else:
-        writer = FFMpegWriter(fps=fps, codec="libx264",
-                              extra_args=["-pix_fmt", "yuv420p"])
+    writer = FFMpegWriter(fps=fps, codec="libx264",
+                          extra_args=["-pix_fmt", "yuv420p"])
 
     print(f"Saving animation to {output_path} ...")
     anim.save(str(output_path), writer=writer, dpi=dpi)
@@ -210,10 +214,11 @@ def find_gripper_odometry(bagpath, video_path, dict_name="DICT_4X4_50"):
         dict_name:  ArUco dictionary name (default: "DICT_4X4_50")
 
     Returns:
-        Tuple of three dicts, all keyed by marker_id (int):
-            all_pixel_arrays       – marker_id -> (1, 2, T)  centroid (u, v) per frame
-            all_pixel_depth_arrays – marker_id -> (M, 4)     [u, v, depth_mm, frame_idx]
-            all_odometry_arrays    – marker_id -> (M, 4)     [x, y, z, frame_idx]
+        Tuple of four items:
+            all_pixel_arrays       – Dict[marker_id -> (1, 2, T)]  centroid (u, v) per frame
+            all_pixel_depth_arrays – Dict[marker_id -> (M, 4)]     [u, v, depth_mm, frame_idx]
+            all_odometry_arrays    – Dict[marker_id -> (M, 4)]     [x, y, z, frame_idx]
+            rgb_timestamps         – np.ndarray shape (T,)          per-frame timestamps (seconds)
     """
     # Extract RGB and depth video from rosbag
     video_reader = RosbagVideoReader(
@@ -236,9 +241,11 @@ def find_gripper_odometry(bagpath, video_path, dict_name="DICT_4X4_50"):
     # all_marker_trajectories: Dict[marker_id -> (4, 2, T)]
     all_marker_trajectories = marker_tracker.run()
 
+    rgb_timestamps = video_reader.get_rgb_timestamps()
+
     if not all_marker_trajectories:
         print("No ArUco markers detected in video.")
-        return {}, {}, {}
+        return {}, {}, {}, rgb_timestamps
 
     print(f"Detected {len(all_marker_trajectories)} marker(s): {sorted(all_marker_trajectories.keys())}")
 
@@ -268,27 +275,22 @@ def find_gripper_odometry(bagpath, video_path, dict_name="DICT_4X4_50"):
 
         print(f"  Marker {marker_id}: {len(odometry_array)} valid 3D points")
 
-    return all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays
+    return all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays, rgb_timestamps
 
 
 def main():
-    bagpath = "/home/jdx/Downloads/mark"
-    video_path = "posEstimate/data/mark.mp4"
+    bagpath = "/home/jdx/Downloads/gripper1"
+    video_path = "posEstimate/data/gripper1.mp4"
 
-    # Derive output paths from video_path
-    video_stem = Path(video_path).stem
-    gif_path = Path(video_path).parent / f"{video_stem}_trajectory.gif"
-    mp4_path = Path(video_path).parent / f"{video_stem}_trajectory.mp4"
+    mp4_path = Path(video_path).parent / f"{Path(video_path).stem}_trajectory.mp4"
 
     print("=== Gripper ArUco Marker Odometry ===")
     try:
-        all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays = find_gripper_odometry(
-            bagpath, video_path
-        )
+        all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays, rgb_timestamps = \
+            find_gripper_odometry(bagpath, video_path)
 
         if all_odometry_arrays:
-            save_trajectory_animation(all_odometry_arrays, gif_path, fps=15)
-            save_trajectory_animation(all_odometry_arrays, mp4_path, fps=15)
+            save_trajectory_animation(all_odometry_arrays, mp4_path, rgb_timestamps)
         else:
             print("No odometry data to plot.")
     except Exception as e:

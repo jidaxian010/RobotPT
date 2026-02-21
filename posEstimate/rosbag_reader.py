@@ -6,7 +6,9 @@ from collections import defaultdict
 import cv2
 
 from rosbags.highlevel import AnyReader
-from rosbags.serde import deserialize_cdr
+from rosbags.typesys import get_typestore, Stores
+
+typestore = get_typestore(Stores.LATEST)
 
 
 class RosbagReader:
@@ -85,7 +87,7 @@ class RosbagReader:
         all_data = defaultdict(list)  # topic -> [(timestamp, data), ...]
         
         for conn, ts, raw in reader.messages(connections=list(topic_connections.values())):
-            msg = deserialize_cdr(raw, conn.msgtype)
+            msg = typestore.deserialize_cdr(raw, conn.msgtype)
             t = self.get_stamp_sec(msg, ts)
             
             # Parse based on topic type
@@ -202,7 +204,7 @@ class RosbagReader:
         print(f"Target IMU topics: {list(self.imu_topics.keys())}")
         print(f"Target other topics: {list(self.other_topics.keys())}")
         
-        with AnyReader([self.bagpath]) as reader:
+        with AnyReader([self.bagpath], default_typestore=typestore) as reader:
             all_data = self.read_all_data(reader)
         
         if not all_data:
@@ -445,7 +447,7 @@ class RosbagVideoReader:
         else:
             topic_name = "/left_camera/camera/camera/color/image_raw"
         
-        with AnyReader([self.bagpath]) as reader:
+        with AnyReader([self.bagpath], default_typestore=typestore) as reader:
             camera_conn = None
             for conn in reader.connections:
                 if conn.topic == topic_name:
@@ -463,7 +465,7 @@ class RosbagVideoReader:
                     frame_count += 1
                     continue
                 
-                msg = deserialize_cdr(raw, conn.msgtype)
+                msg = typestore.deserialize_cdr(raw, conn.msgtype)
                 try:
                     timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
                 except:
@@ -493,7 +495,7 @@ class RosbagVideoReader:
         
         
         # Open the bag file and find the camera topic
-        with AnyReader([self.bagpath]) as reader:
+        with AnyReader([self.bagpath], default_typestore=typestore) as reader:
             # Find the camera connection
             camera_conn = None
             for conn in reader.connections:
@@ -512,7 +514,7 @@ class RosbagVideoReader:
             frame_count = 0
             
             for conn, ts, raw in reader.messages(connections=[camera_conn]):
-                msg = deserialize_cdr(raw, conn.msgtype)
+                msg = typestore.deserialize_cdr(raw, conn.msgtype)
                 
                 # Skip first N frames
                 if frame_count < self.skip_first_n:
@@ -621,7 +623,7 @@ class RosbagVideoReader:
         print(f"RGB has {len(rgb_timestamps)} frames")
         
         # Open the bag file and find the depth topic
-        with AnyReader([self.bagpath]) as reader:
+        with AnyReader([self.bagpath], default_typestore=typestore) as reader:
             # Find the depth connection
             depth_conn = None
             for conn in reader.connections:
@@ -638,7 +640,7 @@ class RosbagVideoReader:
             depth_data = []  # List of (timestamp, depth_image_array)
             
             for conn, ts, raw in reader.messages(connections=[depth_conn]):
-                msg = deserialize_cdr(raw, conn.msgtype)
+                msg = typestore.deserialize_cdr(raw, conn.msgtype)
                 
                 try:
                     # Get timestamp from message header
@@ -735,7 +737,7 @@ class RosbagVideoReader:
             topic_name = "/left_camera/camera/camera/color/image_raw"
         
         
-        with AnyReader([self.bagpath]) as reader:
+        with AnyReader([self.bagpath], default_typestore=typestore) as reader:
             # Find the depth connection
             depth_conn = None
             for conn in reader.connections:
@@ -753,7 +755,7 @@ class RosbagVideoReader:
             frame_count = 0
             
             for conn, ts, raw in reader.messages(connections=[depth_conn]):
-                msg = deserialize_cdr(raw, conn.msgtype)
+                msg = typestore.deserialize_cdr(raw, conn.msgtype)
                 
                 # Skip first/last N frames (same as RGB)
                 if frame_count < self.skip_first_n:
@@ -858,8 +860,8 @@ def main():
     # print("Test imu_left data shape", sensor_data['imu_left'].shape)
 
     # Read RGB
-    bagpath = Path("/home/jdx/Downloads/mark")
-    out_file = Path("posEstimate/data/mark.mp4")
+    bagpath = Path("/home/jdx/Downloads/gripper1")
+    out_file = Path("posEstimate/data/gripper1.mp4")
     Videoreader = RosbagVideoReader(bagpath, out_file, is_third_person=True, skip_first_n=0, skip_last_n=0)
     
     Videoreader.process_data()

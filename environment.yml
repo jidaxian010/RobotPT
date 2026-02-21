@@ -1,0 +1,21 @@
+name: robotpt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.9,<3.13
+  - numpy>=1.19.0
+  - matplotlib
+  - scipy
+  - ffmpeg  # Required for FFMpegWriter in matplotlib animations
+  - pinocchio  # Robot kinematics for arm_optimo_vel.py
+  - pip
+  - pip:
+    - rosbags>=0.9.0
+    - opencv-python>=4.5.0
+    - opencv-contrib-python>=4.5.0
+    - pin-pink  # IK solver (Stéphane Caron's pink robotics library)
+    - qpsolvers[open_source_solvers]  # QP solver backends (daqp, osqp, etc.)
+    - meshcat-shapes  # Shape helpers for meshcat
+    - loop-rate-limiters  # Rate limiting for control loops
+    - robot-descriptions  # Robot URDF descriptions
