@@ -1,301 +1,173 @@
 import numpy as np
 from pathlib import Path
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, FFMpegWriter
+from scipy.signal import medfilt
 
 from rosbag_reader import RosbagVideoReader
 from object_detect.select_marker import SelectMarker
 from odometry import convert_pixel_array_to_depth_format
+from gripper_visualize import plot_all_markers_3d, save_trajectory_animation
 
 
 # Camera intrinsics (848x480)
-FX = 602.6597900390625
-FY = 602.2169799804688
-CX = 423.1910400390625
-CY = 249.92578125
+_FX = 602.6597900390625
+_FY = 602.2169799804688
+_CX = 423.1910400390625
+_CY = 249.92578125
 
 
-def pixel_depth_to_3d(pixel_depth_array):
+def _pixel_depth_to_3d(pixel_depth_array):
     """
-    Convert pixel depth array to 3D positions with depth smoothing.
+    Convert pixel+depth array to 3D positions with depth smoothing.
 
     Args:
-        pixel_depth_array: shape (N, 4) with columns [u, v, depth_mm, frame_idx]
+        pixel_depth_array: (N, 4)  [u, v, depth_mm, frame_idx]
 
     Returns:
-        odometry_array: shape (M, 4) with columns [x, y, z, frame_idx]
-                        where z = depth, and x/y are lateral offsets in mm.
+        (M, 4)  [x, y, z, frame_idx]  in mm, camera frame
     """
-    from scipy.signal import medfilt
-
     depths = pixel_depth_array[:, 2].copy()
 
     # Clamp jumps larger than 30% of the previous value
-    max_change_percent = 30
     for i in range(1, len(depths)):
         if depths[i] > 0 and depths[i - 1] > 0:
-            pct = abs(depths[i] - depths[i - 1]) / depths[i - 1] * 100
-            if pct > max_change_percent:
+            if abs(depths[i] - depths[i - 1]) / depths[i - 1] > 0.30:
                 depths[i] = depths[i - 1]
 
-    smoothed_depths = medfilt(depths, kernel_size=7)
+    smoothed = medfilt(depths, kernel_size=7)
 
-    odometry_array = []
+    result = []
     for i in range(len(pixel_depth_array)):
-        u = pixel_depth_array[i, 0]
-        v = pixel_depth_array[i, 1]
-        d = smoothed_depths[i]
-        frame_idx = pixel_depth_array[i, 3]
-
+        u, v, _, frame_idx = pixel_depth_array[i]
+        d = smoothed[i]
         if d == 0:
             continue
+        x = (u - _CX) * d / _FX
+        y = (v - _CY) * d / _FY
+        result.append([x, y, d, frame_idx])
 
-        x = (u - CX) * d / FX
-        y = (v - CY) * d / FY
-        odometry_array.append([x, y, d, frame_idx])
-
-    return np.array(odometry_array) if odometry_array else np.empty((0, 4))
+    return np.array(result) if result else np.empty((0, 4))
 
 
-def plot_all_markers_3d(all_odometry):
+class GripperOdometry:
     """
-    Plot 3D trajectories for all detected markers on a single figure.
+    Full pipeline: extract RGB+depth video from a rosbag, detect all ArUco
+    markers, and compute 3D odometry for each marker's centroid.
 
-    Args:
-        all_odometry: Dict[int, np.ndarray] mapping marker_id to (M, 4) array
-                      with columns [x, y, z, frame_idx]
+    Usage:
+        g = GripperOdometry(bagpath, video_path)
+        g.run()
+        g.plot()
+        g.save_animation()
+
+    Results after run():
+        g.all_odometry    – Dict[marker_id -> (M, 4)  [x, y, z, frame_idx]]
+        g.all_pixel_depth – Dict[marker_id -> (N, 4)  [u, v, depth_mm, frame_idx]]
+        g.rgb_timestamps  – np.ndarray (T,)  per-frame timestamps in seconds
     """
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
 
-    marker_ids = sorted(all_odometry.keys())
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(marker_ids), 1)))
+    def __init__(self, bagpath, video_path, dict_name="DICT_4X4_50"):
+        self.bagpath = Path(bagpath)
+        self.video_path = Path(video_path)
+        self.dict_name = dict_name
 
-    for color, marker_id in zip(colors, marker_ids):
-        odometry_array = all_odometry[marker_id]
-        if len(odometry_array) == 0:
-            continue
-        posx = odometry_array[:, 0]
-        posy = odometry_array[:, 2]   # depth as Y axis
-        posz = -odometry_array[:, 1]  # flip image-v to world-Z
-        ax.plot(posx, posy, posz, color=color, label=f"Marker {marker_id}")
+        self.all_odometry: dict = {}
+        self.all_pixel_depth: dict = {}
+        self.rgb_timestamps: np.ndarray | None = None
 
-    ax.scatter(0, 0, 0, color="black", s=100, marker="*", label="Camera")
-    ax.legend()
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Depth (mm)")
-    ax.set_zlabel("Z (mm)")
-    ax.set_title("3D Trajectory – All ArUco Markers")
-    ax.axis("equal")
-    plt.tight_layout()
-    plt.show()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
+    def run(self):
+        """Run the full pipeline. Returns self for optional chaining."""
+        video_reader = self._build_video_reader()
+        video_reader.process_data()
+        video_reader.save_depth_video()
 
-def save_trajectory_animation(all_odometry, output_path, rgb_timestamps, dpi=100):
-    """
-    Save an animated 3D trajectory of all ArUco markers as an MP4.
+        all_marker_trajectories = self._detect_markers()
+        self.rgb_timestamps = video_reader.get_rgb_timestamps()
 
-    Playback speed matches the original video: fps is derived from the rosbag
-    RGB timestamps so each animation frame covers exactly the same wall-clock
-    duration as the corresponding video frame.
+        if not all_marker_trajectories:
+            print("No ArUco markers detected.")
+            return self
 
-    Args:
-        all_odometry:    Dict[int, np.ndarray] mapping marker_id to (M, 4) array
-                         with columns [x, y, z, frame_idx]
-        output_path:     Path to save the MP4
-        rgb_timestamps:  np.ndarray shape (T,) of per-frame timestamps in
-                         seconds, as returned by RosbagVideoReader.get_rgb_timestamps()
-        dpi:             DPI of the rendered figure
-    """
-    output_path = Path(output_path)
+        print(f"Detected {len(all_marker_trajectories)} marker(s): "
+              f"{sorted(all_marker_trajectories.keys())}")
 
-    # Collect all 3D points to compute axis limits
-    all_pts = np.vstack([
-        odo[:, :3] for odo in all_odometry.values() if len(odo) > 0
-    ])
-    margin = 50  # mm
+        for marker_id, corners in all_marker_trajectories.items():
+            self._process_marker(marker_id, corners, video_reader)
 
-    # Global frame index range across all markers
-    all_frame_idxs = np.concatenate([
-        odo[:, 3] for odo in all_odometry.values() if len(odo) > 0
-    ]).astype(int)
-    min_fi, max_fi = int(all_frame_idxs.min()), int(all_frame_idxs.max())
-    frame_range = range(min_fi, max_fi + 1)
+        return self
 
-    # Derive fps from actual rosbag timestamps so playback matches the video
-    n_frames = max_fi - min_fi + 1
-    time_span = float(rgb_timestamps[max_fi] - rgb_timestamps[min_fi])
-    fps = n_frames / time_span if time_span > 0 else 30.0
-    interval_ms = 1000.0 / fps
+    def plot(self):
+        """Pop up an interactive 3D trajectory window."""
+        plot_all_markers_3d(self.all_odometry)
 
-    # Build per-marker lookup: frame_idx -> (x, y, z)
-    marker_ids = sorted(all_odometry.keys())
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(marker_ids), 1)))
+    def save_animation(self, output_path=None):
+        """
+        Save the animated trajectory as MP4.
+        Defaults to <video_stem>_trajectory.mp4 next to the video file.
+        """
+        if output_path is None:
+            output_path = (self.video_path.parent /
+                           f"{self.video_path.stem}_trajectory.mp4")
+        save_trajectory_animation(self.all_odometry, output_path,
+                                  self.rgb_timestamps)
 
-    marker_lookup = {}
-    for marker_id, odo in all_odometry.items():
-        if len(odo) == 0:
-            continue
-        marker_lookup[marker_id] = {int(row[3]): row[:3] for row in odo}
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
-    # Set up figure
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection="3d")
+    def _build_video_reader(self):
+        return RosbagVideoReader(
+            self.bagpath, self.video_path,
+            is_third_person=True, skip_first_n=0, skip_last_n=0,
+        )
 
-    ax.set_xlim(all_pts[:, 0].min() - margin, all_pts[:, 0].max() + margin)
-    ax.set_ylim(all_pts[:, 2].min() - margin, all_pts[:, 2].max() + margin)
-    ax.set_zlim(-all_pts[:, 1].max() - margin, -all_pts[:, 1].min() + margin)
-    ax.set_xlabel("X (mm)")
-    ax.set_ylabel("Depth (mm)")
-    ax.set_zlabel("Z (mm)")
-    ax.set_title("3D Trajectory – All ArUco Markers")
-    ax.scatter(0, 0, 0, color="black", s=100, marker="*", zorder=5)
+    def _detect_markers(self):
+        annotated_path = (self.video_path.parent /
+                          f"{self.video_path.stem}_all_markers.mp4")
+        tracker = SelectMarker(
+            input_path=str(self.video_path),
+            output_path=str(annotated_path),
+            dict_name=self.dict_name,
+        )
+        return tracker.run()  # Dict[marker_id -> (4, 2, T)]
 
-    # One line + one dot per marker
-    lines, dots = {}, {}
-    for color, marker_id in zip(colors, marker_ids):
-        (line,) = ax.plot([], [], [], color=color, linewidth=1.5,
-                          label=f"Marker {marker_id}")
-        (dot,) = ax.plot([], [], [], color=color, marker="o", markersize=6,
-                         linestyle="None")
-        lines[marker_id] = line
-        dots[marker_id] = dot
+    def _process_marker(self, marker_id, corners, video_reader):
+        """Compute centroid pixel trajectory → depth lookup → 3D odometry."""
+        centroid = np.nanmean(corners, axis=0, keepdims=True)  # (1, 2, T)
+        pixel_for_depth = convert_pixel_array_to_depth_format(centroid)
 
-    ax.legend(loc="upper left", fontsize=8)
+        if len(pixel_for_depth) == 0:
+            print(f"  Marker {marker_id}: no valid pixels, skipping.")
+            return
 
-    # Cumulative history per marker (world coords)
-    history = {mid: ([], [], []) for mid in marker_ids}
+        pixel_depth = video_reader.find_depth(pixel_for_depth)  # (N, 4)
+        self.all_pixel_depth[marker_id] = pixel_depth
 
-    frame_text = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, fontsize=8)
+        odometry = _pixel_depth_to_3d(pixel_depth)             # (M, 4)
+        self.all_odometry[marker_id] = odometry
 
-    def update(frame_idx):
-        for marker_id in marker_ids:
-            if marker_id not in marker_lookup:
-                continue
-            pos = marker_lookup[marker_id].get(frame_idx)
-            if pos is not None:
-                hx, hy, hz = history[marker_id]
-                hx.append(pos[0])
-                hy.append(pos[2])   # depth as Y
-                hz.append(-pos[1])  # flip image-v to world-Z
-
-            hx, hy, hz = history[marker_id]
-            if hx:
-                lines[marker_id].set_data(hx, hy)
-                lines[marker_id].set_3d_properties(hz)
-                dots[marker_id].set_data([hx[-1]], [hy[-1]])
-                dots[marker_id].set_3d_properties([hz[-1]])
-
-        frame_text.set_text(f"frame {frame_idx}")
-        return list(lines.values()) + list(dots.values()) + [frame_text]
-
-    anim = FuncAnimation(
-        fig, update, frames=frame_range,
-        interval=interval_ms, blit=False,
-    )
-
-    writer = FFMpegWriter(fps=fps, codec="libx264",
-                          extra_args=["-pix_fmt", "yuv420p"])
-
-    print(f"Saving animation to {output_path} ...")
-    anim.save(str(output_path), writer=writer, dpi=dpi)
-    print(f"Saved: {output_path}")
-    plt.close(fig)
+        print(f"  Marker {marker_id}: {len(odometry)} valid 3D points")
 
 
-def find_gripper_odometry(bagpath, video_path, dict_name="DICT_4X4_50"):
-    """
-    Detect all ArUco markers in the video and compute 3D odometry for each
-    marker's centroid (mean of its 4 corners).
-
-    Args:
-        bagpath:    Path to rosbag directory / file
-        video_path: Path to output video file (MP4)
-        dict_name:  ArUco dictionary name (default: "DICT_4X4_50")
-
-    Returns:
-        Tuple of four items:
-            all_pixel_arrays       – Dict[marker_id -> (1, 2, T)]  centroid (u, v) per frame
-            all_pixel_depth_arrays – Dict[marker_id -> (M, 4)]     [u, v, depth_mm, frame_idx]
-            all_odometry_arrays    – Dict[marker_id -> (M, 4)]     [x, y, z, frame_idx]
-            rgb_timestamps         – np.ndarray shape (T,)          per-frame timestamps (seconds)
-    """
-    # Extract RGB and depth video from rosbag
-    video_reader = RosbagVideoReader(
-        Path(bagpath), Path(video_path),
-        is_third_person=True, skip_first_n=0, skip_last_n=0,
-    )
-    video_reader.process_data()
-    video_reader.save_depth_video()
-
-    # Detect all ArUco markers across every frame
-    video_path_obj = Path(video_path)
-    output_path = video_path_obj.parent / f"{video_path_obj.stem}_all_markers.mp4"
-
-    marker_tracker = SelectMarker(
-        input_path=video_path,
-        output_path=str(output_path),
-        dict_name=dict_name,
-    )
-
-    # all_marker_trajectories: Dict[marker_id -> (4, 2, T)]
-    all_marker_trajectories = marker_tracker.run()
-
-    rgb_timestamps = video_reader.get_rgb_timestamps()
-
-    if not all_marker_trajectories:
-        print("No ArUco markers detected in video.")
-        return {}, {}, {}, rgb_timestamps
-
-    print(f"Detected {len(all_marker_trajectories)} marker(s): {sorted(all_marker_trajectories.keys())}")
-
-    all_pixel_arrays = {}
-    all_pixel_depth_arrays = {}
-    all_odometry_arrays = {}
-
-    for marker_id, corners_array in all_marker_trajectories.items():
-        # corners_array: (4, 2, T) → centroid over 4 corners → (1, 2, T)
-        centroid_array = np.nanmean(corners_array, axis=0, keepdims=True)
-        all_pixel_arrays[marker_id] = centroid_array
-
-        # Convert to (N, 3) [u, v, frame_idx] for depth lookup
-        pixel_array_for_depth = convert_pixel_array_to_depth_format(centroid_array)
-
-        if len(pixel_array_for_depth) == 0:
-            print(f"  Marker {marker_id}: no valid pixel data, skipping.")
-            continue
-
-        # Look up depth → (N, 4) [u, v, depth_mm, frame_idx]
-        pixel_depth_array = video_reader.find_depth(pixel_array_for_depth)
-        all_pixel_depth_arrays[marker_id] = pixel_depth_array
-
-        # Project to 3D with smoothing
-        odometry_array = pixel_depth_to_3d(pixel_depth_array)
-        all_odometry_arrays[marker_id] = odometry_array
-
-        print(f"  Marker {marker_id}: {len(odometry_array)} valid 3D points")
-
-    return all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays, rgb_timestamps
-
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 
 def main():
-    bagpath = "/home/jdx/Downloads/gripper1"
-    video_path = "posEstimate/data/gripper1.mp4"
+    g = GripperOdometry(
+        bagpath="/home/jdx/Downloads/gripper2",
+        video_path="posEstimate/data/gripper2.mp4",
+    )
+    g.run()
 
-    mp4_path = Path(video_path).parent / f"{Path(video_path).stem}_trajectory.mp4"
-
-    print("=== Gripper ArUco Marker Odometry ===")
-    try:
-        all_pixel_arrays, all_pixel_depth_arrays, all_odometry_arrays, rgb_timestamps = \
-            find_gripper_odometry(bagpath, video_path)
-
-        if all_odometry_arrays:
-            save_trajectory_animation(all_odometry_arrays, mp4_path, rgb_timestamps)
-        else:
-            print("No odometry data to plot.")
-    except Exception as e:
-        print(f"Gripper odometry failed: {e}")
-        raise
+    if g.all_odometry:
+        g.plot()
+        g.save_animation()
+    else:
+        print("No odometry data.")
 
 
 if __name__ == "__main__":
