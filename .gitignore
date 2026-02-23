@@ -1,4 +1,5 @@
 # data
+*.csv
 *.jsonl
 *.h5
 *.mp4

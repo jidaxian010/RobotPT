@@ -2,32 +2,39 @@
 Marker-to-gripper geometric configurations.
 
 Each MarkerConfig defines the fixed SE(3) transform from a marker's frame to
-the gripper's Centre-of-Mass (CoM) frame.  Replace the placeholder values with
-physically measured numbers once the gripper is available for calibration.
+the gripper's frame (f0).
 
 Coordinate conventions
 ----------------------
-Gripper body frame (assumed):
-    +X  right  (toward the right face — where marker 6 lives)
-    +Y  forward / along approach direction
-    +Z  up
+Gripper body frame f0:
+    origin at the gripper CoM / reference point
+    axes as defined by the CAD model
 
-ArUco marker frame (standard OpenCV):
+ArUco marker frame (standard OpenCV), shared with each face frame f_i:
     +X  right along marker face   (when viewed from the front)
     +Y  up along marker face      (when viewed from the front)
     +Z  pointing OUT of the marker face (toward the camera)
 
-SE(3) math used when computing gripper pose from a detected marker
-------------------------------------------------------------------
-solvePnP gives T_cam←marker = { R_cm, t_cm } such that
-    p_cam = R_cm @ p_marker + t_cm
+T_i0  (face frame f_i → gripper frame f0)
+-----------------------------------------
+Stored as module-level 4×4 homogeneous matrices. Derived from CAD.
 
-MarkerConfig gives T_marker←com = { R_mc, t_mc } such that
-    p_marker = R_mc @ p_com + t_mc
+    p_f0 = T_i0 @ p_fi   (homogeneous)
 
-Therefore:
-    R_cam←com = R_cm @ R_mc
-    t_cam←com = R_cm @ t_mc + t_cm
+SE(3) math used by the two pose-recovery paths
+-----------------------------------------------
+Path A — single-marker solvePnP (backward compat, gripper_odemetry.compute_gripper_poses):
+    solvePnP gives T_cam←marker = { R_cm, t_cm }
+        p_cam = R_cm @ p_marker + t_cm
+    MarkerConfig gives T_marker←f0 = { R_mc, t_mc }
+        p_marker = R_mc @ p_f0 + t_mc
+    Therefore:
+        R_cam←f0 = R_cm @ R_mc
+        t_cam←f0 = R_cm @ t_mc + t_cm
+
+Path B — multi-marker solvePnP (gripper_odemetry.compute_gripper_poses_fused):
+    3D corners of each marker are pre-computed in f0 using T_i0.
+    A single solvePnP call over all visible corners yields T_cam←f0 directly.
 """
 
 from dataclasses import dataclass
@@ -39,47 +46,97 @@ class MarkerConfig:
     marker_id: int
     marker_size_mm: float
 
-    # Translation: CoM origin expressed in the MARKER frame (mm).
-    # i.e. "where is the gripper CoM relative to the marker centre?"
+    # --- Path A fields (single-marker solvePnP) ---
+
+    # Translation: f0 origin expressed in the MARKER frame (mm).
+    # t_marker_to_com = -R_i0.T @ t_i0
     t_marker_to_com: np.ndarray  # shape (3,)
 
-    # Rotation: maps a vector from marker frame to gripper CoM frame.
-    # R_marker_to_com @ v_marker = v_gripper
+    # Rotation: maps a vector from marker frame to gripper f0 frame.
+    # R_marker_to_com @ v_marker = v_f0
+    # R_marker_to_com = T_i0[:3, :3]
     R_marker_to_com: np.ndarray  # shape (3, 3)
 
+    # --- Path B field (multi-marker solvePnP) ---
+
+    # Position of the marker origin in the gripper frame f0 (mm).
+    # t_gripper_origin_mm = T_i0[:3, 3]
+    # Used to compute 3D corner positions in f0 for the pooled solvePnP.
+    t_gripper_origin_mm: np.ndarray  # shape (3,)
+
 
 # ---------------------------------------------------------------------------
-# Placeholder values — calibrate before use
+# Face-to-gripper transforms  (CAD-derived, exact)
+# ---------------------------------------------------------------------------
+#
+# Naming: T<i>0  =  T_{face_i → gripper_f0}
+#   marker 7  on face 1  →  T10
+#   marker 10 on face 2  →  T20
+#   marker 11 on face 3  →  T30
+#   marker 8  on face 4  →  T40
+#   marker 9  on face 5  →  T50
+
+_T10 = np.array([
+    [0.0, 0.0, -1.0, -214.2],
+    [0.0, 1.0,  0.0,  -22.5],
+    [1.0, 0.0,  0.0, -392.7],
+    [0.0, 0.0,  0.0,    1.0],
+], dtype=float)
+
+_T20 = np.array([
+    [ 0.7071, 0.0, -0.7071, -187.3],
+    [ 0.0,    1.0,  0.0,     -22.5],
+    [ 0.7071, 0.0,  0.7071, -327.7],
+    [ 0.0,    0.0,  0.0,       1.0],
+], dtype=float)
+
+_T30 = np.array([
+    [0.0, -0.6654, -0.7465, -188.9],
+    [0.0,  0.7465, -0.6654,  -89.04],
+    [1.0,  0.0,     0.0,    -392.7],
+    [0.0,  0.0,     0.0,       1.0],
+], dtype=float)
+
+_T40 = np.array([
+    [-0.7071, 0.0, -0.7071, -187.3],
+    [ 0.0,    1.0,  0.0,     -22.5],
+    [ 0.7071, 0.0, -0.7071, -457.8],
+    [ 0.0,    0.0,  0.0,       1.0],
+], dtype=float)
+
+_T50 = np.array([
+    [0.0,  0.7465, -0.6654, -188.9],
+    [0.0,  0.6654,  0.7465,  -44.0],
+    [1.0,  0.0,     0.0,    -392.7],
+    [0.0,  0.0,     0.0,       1.0],
+], dtype=float)
+
+
+_MARKER_SIZE_MM = 40.0
+
+
+def _config_from_T(marker_id: int, T: np.ndarray,
+                   marker_size_mm: float = _MARKER_SIZE_MM) -> MarkerConfig:
+    """Build a MarkerConfig from a 4×4 face-to-gripper transform T_i0."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    return MarkerConfig(
+        marker_id=marker_id,
+        marker_size_mm=marker_size_mm,
+        R_marker_to_com=R,
+        t_marker_to_com=-R.T @ t,   # f0 origin in marker frame
+        t_gripper_origin_mm=t,      # marker origin in f0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public config dict
 # ---------------------------------------------------------------------------
 
-_MARKER_SIZE_MM   = 40.0   # physical side length of the printed marker
-_HALF_WIDTH_MM    = 50.0   # half the gripper width in X  (placeholder)
-
-# Marker 6 — attached to the EXACT right surface of the gripper.
-#
-# Geometry of the right-face attachment:
-#   • Marker face normal (+Z_marker) points in gripper +X  (outward)
-#   • Marker +Y_marker  aligns with gripper +Z             (up)
-#   • Marker +X_marker  aligns with gripper −Y             (forward→backward)
-#
-# The CoM sits ~_HALF_WIDTH_MM inward along the marker's −Z axis.
-#
-#  R_marker_to_com  columns = marker basis vectors expressed in gripper frame:
-#    col-0  marker +X  →  gripper [ 0, −1,  0]
-#    col-1  marker +Y  →  gripper [ 0,  0,  1]
-#    col-2  marker +Z  →  gripper [ 1,  0,  0]
-_R_MARKER6_TO_COM = np.array(
-    [[ 0,  0,  1],
-     [-1,  0,  0],
-     [ 0,  1,  0]],
-    dtype=float,
-)
-
-MARKER_CONFIGS: dict[int, "MarkerConfig"] = {
-    6: MarkerConfig(
-        marker_id=6,
-        marker_size_mm=_MARKER_SIZE_MM,
-        t_marker_to_com=np.array([0.0, 0.0, -_HALF_WIDTH_MM]),
-        R_marker_to_com=_R_MARKER6_TO_COM,
-    ),
+MARKER_CONFIGS: dict[int, MarkerConfig] = {
+    0:  _config_from_T(0,  _T10),
+    1: _config_from_T(1, _T20),
+    2: _config_from_T(2, _T30),
+    3:  _config_from_T(3,  _T40),
+    4:  _config_from_T(4,  _T50),
 }

@@ -10,49 +10,102 @@ import mediapipe as mp
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import get_typestore, Stores
 from rosbag_reader import RosbagVideoReader
+from joint_tracker import PoseTracker, VIS_THRESHOLD
 
 typestore = get_typestore(Stores.LATEST)
 
-BaseOptions          = mp.tasks.BaseOptions
-PoseLandmarker       = mp.tasks.vision.PoseLandmarker
+BaseOptions           = mp.tasks.BaseOptions
+PoseLandmarker        = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
-RunningMode          = mp.tasks.vision.RunningMode
-_CONNECTIONS         = mp.tasks.vision.PoseLandmarksConnections.POSE_LANDMARKS
+RunningMode           = mp.tasks.vision.RunningMode
+_CONNECTIONS          = mp.tasks.vision.PoseLandmarksConnections.POSE_LANDMARKS
 
 MODEL_PATH = str(Path(__file__).resolve().parent.parent /
                  "data" / "pose_landmarker_full.task")
 
 
-def _draw_pose(frame, landmarks, h, w):
-    """Draw skeleton on frame using normalised landmarks."""
-    # Draw connections
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
+def _vis_color(vis: float):
+    """
+    Map visibility [0, 1] → BGR color:
+        1.0 → green  (0, 255, 0)
+        0.5 → yellow (0, 255, 255)
+        0.0 → red    (0, 0, 255)
+    """
+    v = max(0.0, min(1.0, vis))
+    if v >= 0.5:
+        r = int(255 * 2 * (1.0 - v))
+        return (0, 255, r)
+    else:
+        g = int(255 * 2 * v)
+        return (0, g, 255)
+
+
+def _draw_pose(frame, landmarks, tracked_states, h, w):
+    """
+    Draw skeleton using Kalman-smoothed positions coloured by raw visibility.
+
+    Position  → from tracker (smoothed, outlier-rejected)
+    Colour    → from raw MediaPipe visibility (green=confident, red=uncertain)
+    Fallback  → raw landmark pixel if joint not yet initialised in tracker
+    """
+    def _pt(i):
+        """Return (x, y) pixel for joint i: tracked if available, else raw."""
+        s = tracked_states[i] if tracked_states else None
+        if s is not None:
+            return (int(s.position[0]), int(s.position[1]))
+        lm = landmarks[i]
+        return (int(lm.x * w), int(lm.y * h))
+
+    # Connections
     for conn in _CONNECTIONS:
-        a = landmarks[conn.start]
-        b = landmarks[conn.end]
-        if a.visibility < 0.3 or b.visibility < 0.3:
+        a, b = landmarks[conn.start], landmarks[conn.end]
+        vis = min(a.visibility, b.visibility)
+        if vis < 0.15:
             continue
-        pt1 = (int(a.x * w), int(a.y * h))
-        pt2 = (int(b.x * w), int(b.y * h))
-        cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+        cv2.line(frame, _pt(conn.start), _pt(conn.end), _vis_color(vis), 2)
 
-    # Draw joints
-    for lm in landmarks:
-        if lm.visibility < 0.3:
+    # Joints
+    for i, lm in enumerate(landmarks):
+        if lm.visibility < 0.15:
             continue
-        cx, cy = int(lm.x * w), int(lm.y * h)
-        cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
-        cv2.circle(frame, (cx, cy), 4, (0, 128, 255),   1)
+        cv2.circle(frame, _pt(i), 5, _vis_color(lm.visibility), -1)
 
+
+
+def _draw_vis_legend(frame, h, w):
+    """Draw a small green→yellow→red colorbar in the top-right corner."""
+    bar_w, bar_h = 12, 80
+    x0 = w - bar_w - 8
+    y0 = 8
+    for row in range(bar_h):
+        vis = 1.0 - row / bar_h
+        color = _vis_color(vis)
+        cv2.rectangle(frame, (x0, y0 + row), (x0 + bar_w, y0 + row + 1), color, -1)
+    cv2.putText(frame, "vis", (x0 - 2, y0 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    cv2.putText(frame, "1.0", (x0 + bar_w + 2, y0 + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+    cv2.putText(frame, "0.0", (x0 + bar_w + 2, y0 + bar_h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
 
 class HumanPose:
     """
     Read RGB frames from a rosbag, run MediaPipe PoseLandmarker on each
-    frame, and save an annotated video with skeleton overlays.
+    frame, apply per-joint Kalman filtering, and save an annotated video.
 
-    Usage
-    -----
-        h = HumanPose(bagpath, output_path)
-        h.run()
+    Visualisation layers
+    --------------------
+    Raw (visibility-colored):  green = fully visible, yellow = partial, red = occluded
+    Tracked (cyan):            Kalman-smoothed positions; sigma-circles show uncertainty
     """
 
     def __init__(self, bagpath, output_path, is_third_person=True,
@@ -64,7 +117,6 @@ class HumanPose:
         self.min_tracking_confidence  = min_tracking_confidence
 
     def run(self):
-        """Stream frames from the bag, annotate with pose, save video."""
         topic = (
             "/third_person_cam/camera/camera/color/image_raw"
             if self.is_third_person
@@ -85,8 +137,6 @@ class HumanPose:
         self._write_video(annotated, fps, w, h)
         print(f"Saved annotated video: {self.output_path}")
 
-    # ------------------------------------------------------------------
-    # Private helpers
     # ------------------------------------------------------------------
 
     def _read_frames(self, topic):
@@ -130,25 +180,44 @@ class HumanPose:
             min_tracking_confidence=self.min_tracking_confidence,
         )
 
-        t0_ms = int(timestamps[0] * 1000)
+        # Kalman tracker in pixel-space (x*w, y*h, z*w)
+        tracker = PoseTracker(sigma_a=500.0, R_base=8.0)
+        dts = [0.0] + list(np.diff(timestamps))
+
+        t0_ms    = int(timestamps[0] * 1000)
         annotated = []
 
         with PoseLandmarker.create_from_options(options) as landmarker:
-            for i, (bgr, ts) in enumerate(zip(frames, timestamps)):
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            for i, (bgr, ts, dt) in enumerate(zip(frames, timestamps, dts)):
+                rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 ts_ms  = int(ts * 1000) - t0_ms
 
                 result = landmarker.detect_for_video(mp_img, ts_ms)
 
                 out = bgr.copy()
+
                 if result.pose_landmarks:
-                    _draw_pose(out, result.pose_landmarks[0], h, w)
+                    lms = result.pose_landmarks[0]
+
+                    # Build (33, 3) pixel-space positions and (33,) visibilities
+                    positions    = np.array([[lm.x * w, lm.y * h, lm.z * w]
+                                             for lm in lms])
+                    visibilities = np.array([lm.visibility for lm in lms])
+
+                    tracked = tracker.update(positions, visibilities, dt)
+                    _draw_pose(out, lms, tracked, h, w)
                 else:
                     cv2.putText(out, "No pose detected", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    # Still run tracker in predict-only mode
+                    dummy_vis = np.zeros(33)
+                    dummy_pos = np.zeros((33, 3))
+                    tracker.update(dummy_pos, dummy_vis, dt)
 
+                _draw_vis_legend(out, h, w)
                 annotated.append(out)
+
                 if (i + 1) % 50 == 0:
                     print(f"  Processed {i + 1}/{len(frames)} frames")
 
@@ -169,8 +238,8 @@ class HumanPose:
 
 def main():
     h = HumanPose(
-        bagpath="/home/jdx/Downloads/gripper2",
-        output_path="posEstimate/data/gripper2_pose.mp4",
+        bagpath="/home/jdx/Downloads/gripper1",
+        output_path="posEstimate/data/gripper1_pose.mp4",
     )
     h.run()
 
