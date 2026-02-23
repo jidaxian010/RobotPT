@@ -13,8 +13,10 @@ from rosbag_reader import RosbagVideoReader
 from object_detect.select_marker import SelectMarker
 from odometry import convert_pixel_array_to_depth_format
 from gripper_config import MARKER_CONFIGS
-from gripper_visualize import (plot_all_markers_3d, plot_com_smooth_3d,
-                               plot_fused_orientation, plot_individual_marker_poses)
+from gripper_visualize import (plot_markers_camera_frame,
+                               plot_gripper_camera_frame,
+                               plot_gripper_body_frame)
+from denoise import denoise_all_marker_poses, denoise_pose_list
 
 
 # Camera intrinsics (848x480)
@@ -160,7 +162,7 @@ class GripperOdometry:
     """
 
     def __init__(self, bagpath, video_path, dict_name="DICT_4X4_50",
-                 crop=None, crop_unit="frame"):
+                 crop=None, crop_unit="frame", denoise=True):
         """
         Args:
             bagpath, video_path: as before.
@@ -168,6 +170,8 @@ class GripperOdometry:
                        Pass -1 or None for end to go to the last frame.
             crop_unit: "frame" (default) — integer frame indices.
                        "s"     — timestamps in seconds.
+            denoise:   bool (default True). Apply aggressive median+Gaussian
+                       smoothing to raw poses before plotting/saving.
         """
         self.bagpath    = Path(bagpath)
         self.video_path = Path(video_path)
@@ -176,6 +180,7 @@ class GripperOdometry:
         self._crop      = crop
         self._crop_unit = crop_unit
         self._frame_offset = 0   # set during run() when crop is active
+        self.denoise    = denoise
 
         self.all_odometry:            dict = {}
         self.all_pixel_depth:         dict = {}
@@ -334,10 +339,11 @@ class GripperOdometry:
                 R_cm = mp["R"]
                 t_cm = mp["tvec"].flatten()
 
-                # Apply T_marker←com  (from MarkerConfig)
-                # R_cam←com = R_cm @ R_mc
-                # t_cam←com = R_cm @ t_mc + t_cm
-                R_cam_com = R_cm @ cfg.R_marker_to_com
+                # Apply T_marker←f0  (from MarkerConfig)
+                # R_marker_to_com = R_i0 = R_{f0←fi}
+                # R_cam_f0 = R_cm @ R_{fi←f0} = R_cm @ R_i0.T
+                # t_cam_f0 = R_cm @ t_marker_to_com + t_cm
+                R_cam_com = R_cm @ cfg.R_marker_to_com.T
                 t_cam_com = R_cm @ cfg.t_marker_to_com + t_cm
 
                 gripper_poses.append({
@@ -364,9 +370,10 @@ class GripperOdometry:
         -------
         t            elapsed seconds since the first valid frame
         frame        video frame index
-        pos_x/y/z    position relative to first valid pose (mm); first row = 0,0,0
-        orient_x/y/z Euler XYZ angles relative to first valid pose (rad);
-                     first row = 0,0,0
+        pos_x/y/z    position in initial gripper frame (mm); first row = 0,0,0
+                     = R0.T @ (t_cam_t − t_cam_0)
+        orient_x/y/z Euler XYZ angles in initial gripper frame (rad);
+                     first row = 0,0,0  = R0.T @ R_cam_t
         """
         if output_dir is None:
             output_dir = self.video_path.parent
@@ -398,7 +405,7 @@ class GripperOdometry:
                               "orient_x", "orient_y", "orient_z"])
             for _, pose in poses:
                 ts    = float(self.rgb_timestamps[pose["frame_idx"]]) - ts0
-                pos   = pose["position"] - t0
+                pos   = R0.T @ (pose["position"] - t0)
                 R_rel = R0.T @ pose["rotation"]
                 euler = ScipyRotation.from_matrix(R_rel).as_euler("xyz")
                 writer.writerow([
@@ -505,6 +512,58 @@ class GripperOdometry:
               f"{np.mean([p['n_markers'] for p in poses if p is not None]):.1f})")
         return poses
 
+    def compute_gripper_poses_averaged(self, marker_configs=None):
+        """
+        For each frame, estimate gripper pose independently from each visible
+        marker (via solvePnP + T matrix), then average the estimates.
+
+        Position:  simple mean of all per-marker t_cam_f0 vectors.
+        Rotation:  quaternion mean (sign-aligned to first, then normalised).
+
+        Returns:
+            List[dict | None]  same format as compute_gripper_poses_fused().
+        """
+        all_gripper_poses = self.compute_gripper_poses(marker_configs)
+        if not all_gripper_poses:
+            return []
+
+        T = len(next(iter(all_gripper_poses.values())))
+        averaged = []
+
+        for frame_t in range(T):
+            positions, quats = [], []
+            for poses in all_gripper_poses.values():
+                p = poses[frame_t]
+                if p is not None:
+                    positions.append(p["position"])
+                    quats.append(ScipyRotation.from_matrix(p["rotation"]).as_quat())
+
+            if not positions:
+                averaged.append(None)
+                continue
+
+            avg_pos = np.mean(positions, axis=0)
+
+            q = np.array(quats)
+            for i in range(1, len(q)):          # sign-align to first
+                if np.dot(q[i], q[0]) < 0:
+                    q[i] = -q[i]
+            avg_q = q.mean(axis=0)
+            avg_q /= np.linalg.norm(avg_q)
+
+            averaged.append({
+                "position":  avg_pos,
+                "rotation":  ScipyRotation.from_quat(avg_q).as_matrix(),
+                "frame_idx": frame_t,
+                "n_markers": len(positions),
+            })
+
+        valid = sum(1 for p in averaged if p is not None)
+        print(f"  Averaged pose: {valid}/{T} frames "
+              f"(avg markers/frame: "
+              f"{np.mean([p['n_markers'] for p in averaged if p is not None]):.1f})")
+        return averaged
+
     def save_fused_poses_csv(self, fused_poses, output_dir=None):
         """
         Save the fused gripper trajectory relative to the first valid frame.
@@ -535,7 +594,7 @@ class GripperOdometry:
                              "n_markers"])
             for _, pose in valid:
                 ts    = float(self.rgb_timestamps[pose["frame_idx"]]) - ts0
-                pos   = pose["position"] - t0
+                pos   = R0.T @ (pose["position"] - t0)
                 R_rel = R0.T @ pose["rotation"]
                 euler = ScipyRotation.from_matrix(R_rel).as_euler("xyz")
                 writer.writerow([
@@ -597,9 +656,6 @@ class GripperOdometry:
 
         return outputs
 
-    def plot(self):
-        """Pop up fig1: marker centroid trajectories."""
-        plot_all_markers_3d(self.all_odometry)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -666,8 +722,10 @@ def main():
         bagpath="/home/jdx/Downloads/move2",
         video_path="posEstimate/data/move2.mp4",
         # crop=(0, -1),                    # keep frames 0 to end (no-op)
-        # crop=(150, 900),                 # keep frames 150–899
-        # crop=(2.5, 6.0), crop_unit="s",  # keep seconds 1.5–9.0
+        # crop=(150, 900),                 # keep frames
+        # crop=(2.5, 6.0), crop_unit="s",  # keep seconds
+        crop=(5, -1), crop_unit="s", # move2
+        denoise=True,
     )
     g.run()
 
@@ -675,21 +733,25 @@ def main():
         print("No odometry data.")
         return
 
-    g.plot()  # fig1: marker centroid trajectories
-
-    # Step 1 — verify per-marker solvePnP (no T matrix).
-    # All markers on a rigid body should show the same rotation curves.
+    # Plot 1 — markers in camera frame.
     raw_poses = g.compute_marker_poses_raw()
-    plot_individual_marker_poses(raw_poses, g.rgb_timestamps)
+    poses_for_plot = (denoise_all_marker_poses(raw_poses)
+                      if g.denoise else raw_poses)
+    plot_markers_camera_frame(poses_for_plot, g.rgb_timestamps)
 
-    fused_poses = g.compute_gripper_poses_fused()
-    if fused_poses:
-        csv_path = g.save_fused_poses_csv(fused_poses)
-        if csv_path is not None:
-            from traj_smooth import smooth_trajectory
-            _, _, _, _, pos_smooth, _ = smooth_trajectory(str(csv_path))
-            plot_com_smooth_3d(pos_smooth)  # fig2: smoothed CoM trajectory
-        plot_fused_orientation(fused_poses, g.rgb_timestamps)  # fig3: orientation
+    # Plot 2 & 3 — gripper in camera frame, then in gripper frame.
+    # Each marker estimated independently; results averaged per frame.
+    avg_poses = g.compute_gripper_poses_averaged()
+    avg_out   = denoise_pose_list(avg_poses) if g.denoise else avg_poses
+    if any(p is not None for p in avg_out):
+        g.save_fused_poses_csv(avg_out)
+        plot_gripper_camera_frame(avg_out, g.rgb_timestamps)  # plot 2
+        plot_gripper_body_frame(avg_out, g.rgb_timestamps)    # plot 3
+    else:
+        print("No markers detected — no gripper pose.")
+
+    import matplotlib.pyplot as plt
+    plt.show()  # block until user closes all windows
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ Stored as module-level 4×4 homogeneous matrices. Derived from CAD.
 
 SE(3) math used by the two pose-recovery paths
 -----------------------------------------------
-Path A — single-marker solvePnP (backward compat, gripper_odemetry.compute_gripper_poses):
+Path A — single-marker solvePnP (backward compat, gripper_pose.compute_gripper_poses):
     solvePnP gives T_cam←marker = { R_cm, t_cm }
         p_cam = R_cm @ p_marker + t_cm
     MarkerConfig gives T_marker←f0 = { R_mc, t_mc }
@@ -32,7 +32,7 @@ Path A — single-marker solvePnP (backward compat, gripper_odemetry.compute_gri
         R_cam←f0 = R_cm @ R_mc
         t_cam←f0 = R_cm @ t_mc + t_cm
 
-Path B — multi-marker solvePnP (gripper_odemetry.compute_gripper_poses_fused):
+Path B — multi-marker solvePnP (gripper_pose.compute_gripper_poses_fused):
     3D corners of each marker are pre-computed in f0 using T_i0.
     A single solvePnP call over all visible corners yields T_cam←f0 directly.
 """
