@@ -23,7 +23,7 @@ Stored as module-level 4×4 homogeneous matrices. Derived from CAD.
 
 SE(3) math used by the two pose-recovery paths
 -----------------------------------------------
-Path A — single-marker solvePnP (backward compat, gripper_pose.compute_gripper_poses):
+Path A — single-marker solvePnP (backward compat, gripper_odemetry.compute_gripper_poses):
     solvePnP gives T_cam←marker = { R_cm, t_cm }
         p_cam = R_cm @ p_marker + t_cm
     MarkerConfig gives T_marker←f0 = { R_mc, t_mc }
@@ -32,7 +32,7 @@ Path A — single-marker solvePnP (backward compat, gripper_pose.compute_gripper
         R_cam←f0 = R_cm @ R_mc
         t_cam←f0 = R_cm @ t_mc + t_cm
 
-Path B — multi-marker solvePnP (gripper_pose.compute_gripper_poses_fused):
+Path B — multi-marker solvePnP (gripper_odemetry.compute_gripper_poses_fused):
     3D corners of each marker are pre-computed in f0 using T_i0.
     A single solvePnP call over all visible corners yields T_cam←f0 directly.
 """
@@ -114,6 +114,9 @@ _T50 = np.array([
 
 _MARKER_SIZE_MM = 40.0
 
+# Marker size used by the 5-marker gripper 3D print (matches rs.py)
+TAG_MARKER_SIZE_MM = 72.5
+
 
 def _config_from_T(marker_id: int, T: np.ndarray,
                    marker_size_mm: float = _MARKER_SIZE_MM) -> MarkerConfig:
@@ -129,8 +132,18 @@ def _config_from_T(marker_id: int, T: np.ndarray,
     )
 
 
+def _inv_T(T: np.ndarray) -> np.ndarray:
+    """Invert a 4×4 SE(3) matrix without np.linalg.inv."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    T_inv = np.eye(4, dtype=float)
+    T_inv[:3, :3] = R.T
+    T_inv[:3, 3]  = -R.T @ t
+    return T_inv
+
+
 # ---------------------------------------------------------------------------
-# Public config dict
+# Public config dict  (legacy single-marker paths)
 # ---------------------------------------------------------------------------
 
 MARKER_CONFIGS: dict[int, MarkerConfig] = {
@@ -139,4 +152,23 @@ MARKER_CONFIGS: dict[int, MarkerConfig] = {
     2: _config_from_T(2, _T30),
     3:  _config_from_T(3,  _T40),
     4:  _config_from_T(4,  _T50),
+}
+
+# ---------------------------------------------------------------------------
+# TAG_TRANSFORMS  (rs.py-style multi-marker fusion)
+# ---------------------------------------------------------------------------
+#
+# TAG_TRANSFORMS[tag_id] = T_jk  =  T_i0^{-1}
+#
+# Convention:  T_ij (camera←tag, from solvePnP) @ T_jk = T_ik (camera←gripper-k)
+#   p_tag = T_jk @ p_k    →    p_cam = T_ij @ T_jk @ p_k
+#
+# Translation in mm.  Keys 1–5 match the ArUco IDs printed on the 5-face gripper.
+
+TAG_TRANSFORMS: dict[int, np.ndarray] = {
+    1: _inv_T(_T10),  # face 1
+    2: _inv_T(_T20),  # face 2
+    3: _inv_T(_T30),  # face 3
+    4: _inv_T(_T40),  # face 4
+    5: _inv_T(_T50),  # face 5
 }

@@ -12,11 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from rosbag_reader import RosbagVideoReader
 from object_detect.select_marker import SelectMarker
 from odometry import convert_pixel_array_to_depth_format
-from gripper_config import MARKER_CONFIGS
+from gripper_config import MARKER_CONFIGS, TAG_TRANSFORMS, TAG_MARKER_SIZE_MM
 from gripper_visualize import (plot_markers_camera_frame,
                                plot_gripper_camera_frame,
                                plot_gripper_body_frame)
 from denoise import denoise_all_marker_poses, denoise_pose_list
+from gripper_annotate import save_annotated_video as _save_annotated_video
 
 
 # Camera intrinsics (848x480)
@@ -26,6 +27,14 @@ _CX = 423.1910400390625
 _CY = 249.92578125
 _K  = np.array([[_FX, 0, _CX], [0, _FY, _CY], [0, 0, 1]], dtype=np.float32)
 _DIST = np.zeros((4, 1), dtype=np.float32)   # assume undistorted; update if needed
+
+
+def build_T(t, R):
+    """Build a 4×4 homogeneous SE(3) matrix from translation t (3,) and rotation R (3,3)."""
+    T = np.eye(4, dtype=np.float64)
+    T[0:3, 0:3] = np.asarray(R, dtype=np.float64)
+    T[0:3, 3]   = np.asarray(t, dtype=np.float64).flatten()
+    return T
 
 
 def _pixel_depth_to_3d(pixel_depth_array):
@@ -512,56 +521,117 @@ class GripperOdometry:
               f"{np.mean([p['n_markers'] for p in poses if p is not None]):.1f})")
         return poses
 
-    def compute_gripper_poses_averaged(self, marker_configs=None):
+    def compute_gripper_poses_averaged(self, tag_transforms=None):
         """
-        For each frame, estimate gripper pose independently from each visible
-        marker (via solvePnP + T matrix), then average the estimates.
+        Multi-tag gripper pose fusion following the rs.py approach.
 
-        Position:  simple mean of all per-marker t_cam_f0 vectors.
-        Rotation:  quaternion mean (sign-aligned to first, then normalised).
+        For each video frame, every visible ArUco tag contributes an independent
+        estimate of the gripper reference frame k in the camera frame:
+
+            solvePnP  →  R_ij  (rotation of tag j in camera frame i)
+            depth sensor  →  t_ij  (translation, preferred over solvePnP tvec)
+            T_ij = build_T(t_ij, R_ij)
+            T_ik = T_ij @ T_jk        (T_jk = TAG_TRANSFORMS[tag_id])
+
+        Positions are averaged across all visible tags; rotations are averaged
+        via sign-aligned quaternion mean.
 
         Returns:
-            List[dict | None]  same format as compute_gripper_poses_fused().
+            List[dict | None]  length = T (number of video frames).
+            Each dict: {position (3,), rotation (3,3), frame_idx, n_markers}
         """
-        all_gripper_poses = self.compute_gripper_poses(marker_configs)
-        if not all_gripper_poses:
+        if tag_transforms is None:
+            tag_transforms = TAG_TRANSFORMS
+
+        if not self.all_marker_trajectories:
             return []
 
-        T = len(next(iter(all_gripper_poses.values())))
+        T = next(iter(self.all_marker_trajectories.values())).shape[2]
+
+        # Build depth lookup per tag:  actual_frame_idx → depth_mm
+        # Stored frame indices include _frame_offset (applied during run()).
+        depth_lookup: dict[int, dict[int, float]] = {}
+        for tag_id, pda in self.all_pixel_depth.items():
+            depth_lookup[tag_id] = {int(row[3]): float(row[2]) for row in pda}
+
+        # 3D corner coordinates in marker-local frame (Z = 0 plane)
+        half = TAG_MARKER_SIZE_MM / 2.0
+        marker_3d_edges = np.array(
+            [[-half,  half, 0.0],
+             [ half,  half, 0.0],
+             [ half, -half, 0.0],
+             [-half, -half, 0.0]],
+            dtype=np.float32,
+        )
+
         averaged = []
 
         for frame_t in range(T):
-            positions, quats = [], []
-            for poses in all_gripper_poses.values():
-                p = poses[frame_t]
-                if p is not None:
-                    positions.append(p["position"])
-                    quats.append(ScipyRotation.from_matrix(p["rotation"]).as_quat())
+            k_positions: list[np.ndarray] = []  # (3, 1) each
+            k_rotations: list[np.ndarray] = []  # (3, 3) each
 
-            if not positions:
+            # depth indices are stored with the offset already applied
+            depth_key = frame_t + self._frame_offset
+
+            for tag_id, corners_4_2_T in self.all_marker_trajectories.items():
+                if tag_id not in tag_transforms:
+                    continue
+
+                corners = corners_4_2_T[:, :, frame_t].astype(np.float32)
+                if np.any(np.isnan(corners)):
+                    continue
+
+                # solvePnP — reliable rotation from marker geometry
+                ok, rvec, tvec_rgb = cv2.solvePnP(
+                    marker_3d_edges, corners, _K, _DIST,
+                )
+                if not ok:
+                    continue
+
+                R_ij, _ = cv2.Rodrigues(rvec)
+
+                # Translation — prefer aligned depth sensor over solvePnP tvec
+                cx = int(np.mean(corners[:, 0]))
+                cy = int(np.mean(corners[:, 1]))
+                d_mm = depth_lookup.get(tag_id, {}).get(depth_key, 0.0)
+
+                if d_mm > 0:
+                    t_ij = np.array(
+                        [(cx - _CX) * d_mm / _FX,
+                         (cy - _CY) * d_mm / _FY,
+                         d_mm],
+                        dtype=np.float64,
+                    )
+                else:
+                    t_ij = tvec_rgb.flatten().astype(np.float64)
+
+                T_ij = build_T(t_ij, R_ij)
+                T_ik = T_ij @ tag_transforms[tag_id]
+
+                k_positions.append(T_ik[:3, 3:4])  # (3, 1)
+                k_rotations.append(T_ik[:3, :3])   # (3, 3)
+
+            if not k_positions:
                 averaged.append(None)
                 continue
 
-            avg_pos = np.mean(positions, axis=0)
+            # Average positions (simple mean) — mirrors rs.py
+            avg_pos = np.mean(np.stack(k_positions, axis=0), axis=0).flatten()
 
-            q = np.array(quats)
-            for i in range(1, len(q)):          # sign-align to first
-                if np.dot(q[i], q[0]) < 0:
-                    q[i] = -q[i]
-            avg_q = q.mean(axis=0)
-            avg_q /= np.linalg.norm(avg_q)
+            # Use first visible tag's rotation — exact rs.py behaviour
+            R_final = k_rotations[0]
 
             averaged.append({
                 "position":  avg_pos,
-                "rotation":  ScipyRotation.from_quat(avg_q).as_matrix(),
+                "rotation":  R_final,
                 "frame_idx": frame_t,
-                "n_markers": len(positions),
+                "n_markers": len(k_positions),
             })
 
         valid = sum(1 for p in averaged if p is not None)
-        print(f"  Averaged pose: {valid}/{T} frames "
-              f"(avg markers/frame: "
-              f"{np.mean([p['n_markers'] for p in averaged if p is not None]):.1f})")
+        n_m   = [p["n_markers"] for p in averaged if p is not None]
+        print(f"  Multi-tag averaged pose: {valid}/{T} frames "
+              f"(avg markers/frame: {np.mean(n_m):.1f})")
         return averaged
 
     def save_fused_poses_csv(self, fused_poses, output_dir=None):
@@ -607,6 +677,32 @@ class GripperOdometry:
 
         print(f"  Saved fused CoM trajectory: {csv_path}")
         return csv_path
+
+    def save_annotated_video(self, gripper_poses, output_dir=None):
+        """
+        Save a copy of the source video with coordinate frame axes drawn on
+        every detected ArUco marker and on the fused gripper reference frame.
+
+        Args:
+            gripper_poses: List[dict | None] from compute_gripper_poses_averaged().
+            output_dir:    Destination directory.  Defaults to the video folder.
+
+        Returns:
+            Path of the written video, or None on failure.
+        """
+        out_path = None
+        if output_dir is not None:
+            from pathlib import Path as _Path
+            out_path = _Path(output_dir) / f"{self.video_path.stem}_annotated.mp4"
+
+        return _save_annotated_video(
+            video_path=self.video_path,
+            all_marker_trajectories=self.all_marker_trajectories,
+            gripper_poses=gripper_poses,
+            K=_K,
+            dist=_DIST,
+            output_path=out_path,
+        )
 
     def crop_all_videos(self, start, end, unit="frame"):
         """
@@ -719,12 +815,12 @@ class GripperOdometry:
 
 def main():
     g = GripperOdometry(
-        bagpath="/home/jdx/Downloads/move2",
-        video_path="posEstimate/data/move2.mp4",
+        bagpath="/home/jdx/Downloads/pose1",
+        video_path="posEstimate/data/pose1.mp4",
         # crop=(0, -1),                    # keep frames 0 to end (no-op)
         # crop=(150, 900),                 # keep frames
         # crop=(2.5, 6.0), crop_unit="s",  # keep seconds
-        crop=(5, -1), crop_unit="s", # move2
+        crop=(5, -1), crop_unit="s",  # move2
         denoise=True,
     )
     g.run()
@@ -740,11 +836,11 @@ def main():
     plot_markers_camera_frame(poses_for_plot, g.rgb_timestamps)
 
     # Plot 2 & 3 — gripper in camera frame, then in gripper frame.
-    # Each marker estimated independently; results averaged per frame.
     avg_poses = g.compute_gripper_poses_averaged()
     avg_out   = denoise_pose_list(avg_poses) if g.denoise else avg_poses
     if any(p is not None for p in avg_out):
         g.save_fused_poses_csv(avg_out)
+        g.save_annotated_video(avg_poses)   # annotated video always uses raw poses
         plot_gripper_camera_frame(avg_out, g.rgb_timestamps)  # plot 2
         plot_gripper_body_frame(avg_out, g.rgb_timestamps)    # plot 3
     else:

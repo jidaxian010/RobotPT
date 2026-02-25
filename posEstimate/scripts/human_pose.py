@@ -109,12 +109,15 @@ class HumanPose:
     """
 
     def __init__(self, bagpath, output_path, is_third_person=True,
-                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
+                 min_detection_confidence=0.5, min_tracking_confidence=0.5,
+                 ema_alpha=0.35, ema_dead_band=3.0):
         self.bagpath      = Path(bagpath)
         self.output_path  = Path(output_path)
         self.is_third_person = is_third_person
         self.min_detection_confidence = min_detection_confidence
         self.min_tracking_confidence  = min_tracking_confidence
+        self.ema_alpha     = ema_alpha
+        self.ema_dead_band = ema_dead_band
 
     def run(self):
         topic = (
@@ -180,8 +183,8 @@ class HumanPose:
             min_tracking_confidence=self.min_tracking_confidence,
         )
 
-        # Kalman tracker in pixel-space (x*w, y*h, z*w)
-        tracker = PoseTracker(sigma_a=500.0, R_base=8.0)
+        # EMA smoother in pixel-space (x*w, y*h, z*w)
+        tracker = PoseTracker(alpha=self.ema_alpha, dead_band=self.ema_dead_band)
         dts = [0.0] + list(np.diff(timestamps))
 
         t0_ms    = int(timestamps[0] * 1000)
