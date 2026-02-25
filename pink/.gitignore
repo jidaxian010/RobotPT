@@ -1,0 +1,11 @@
+*.pyc
+*.pyo
+.coverage
+.pixi
+.ropeproject
+.tox
+_build
+dist
+doc/build
+examples/pink
+htmlcov

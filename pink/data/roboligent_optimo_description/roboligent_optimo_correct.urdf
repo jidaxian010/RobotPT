@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<robot name="optimo">
+
+  <!-- ros2_control for real hardware -->
+  <ros2_control name="OptimoHardwareInterface" type="system">
+    <hardware>
+      <plugin>optimo_hardware/OptimoHardwareInterface</plugin>
+      <param name="robot_index">0</param>
+    </hardware>
+
+    <joint name="optimo_joint1">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint2">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint3">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint4">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint5">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint6">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="optimo_joint7">
+      <command_interface name="effort">
+        <param name="min">-150</param>
+        <param name="max">150</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+
+  <!-- Separate gripper hardware interface (gripper enabled) -->
+  <ros2_control name="GripperHardwareInterface" type="system">
+    <hardware>
+      <plugin>optimo_hardware/GripperHardwareInterface</plugin>
+      <param name="robot_index">0</param>
+    </hardware>
+    <joint name="optimo_left_finger_joint">
+      <command_interface name="position"/>
+      <command_interface name="effort"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+  </ros2_control>
+
+</robot>

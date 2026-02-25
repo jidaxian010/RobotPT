@@ -1,0 +1,191 @@
+[build-system]
+requires = ["flit_core >=2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "pin-pink"
+readme = "README.md"
+authors = [
+    {name = "Stéphane Caron", email = "stephane.caron@normalesup.org"},
+]
+maintainers = [
+    {name = "Stéphane Caron", email = "stephane.caron@normalesup.org"},
+]
+dynamic = ['version', 'description']
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: Robot Framework :: Library",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "loop-rate-limiters >=0.1.0",
+    "numpy >=1.19.0",
+    "pin >=2.6.3",
+    "qpsolvers >=4.3.1",
+]
+keywords = ["inverse", "kinematics", "pinocchio"]
+
+[project.urls]
+Homepage = "https://stephane-caron.github.io/pink/"
+Documentation = "https://stephane-caron.github.io/pink/"
+Source = "https://github.com/stephane-caron/pink"
+Tracker = "https://github.com/stephane-caron/pink/issues"
+Changelog = "https://github.com/stephane-caron/pink/blob/main/CHANGELOG.md"
+
+[tool.black]
+line-length = 79
+
+[tool.pylint]
+disable = [
+    "C0103",  # Variable name doesn't conform to snake_case naming style
+    "R0801",  # Similar lines in 2 files
+    "R0902",  # Too many instance attributes
+    "R0903",  # Too few public methods
+    "R0913",  # Too many arguments
+    "R0914",  # Too many local variables
+    "R0917",  # Too many positional arguments
+]
+generated-members = [
+    "pin.ARG1",
+    "pin.Data",
+    "pin.GeometryData",
+    "pin.GeometryModel",
+    "pin.Jlog6",
+    "pin.JointModelFreeFlyer",
+    "pin.Model",
+    "pin.ReferenceFrame",
+    "pin.SE3",
+    "pin.centerOfMass",
+    "pin.computeCollisions",
+    "pin.computeDistances",
+    "pin.computeJointJacobians",
+    "pin.dDifference",
+    "pin.difference",
+    "pin.getFrameJacobian",
+    "pin.getJointJacobian",
+    "pin.integrate",
+    "pin.jacobianCenterOfMass",
+    "pin.neutral",
+    "pin.skew",
+    "pin.removeCollisionPairs",
+    "pin.updateFramePlacements",
+]
+
+[tool.flit.module]
+name = "pink"
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.9"
+loop-rate-limiters = ">=0.1.0"
+numpy = ">=1.19.0"
+pinocchio = ">=2.6.3"
+qpsolvers = ">=4.3.1"
+robot_descriptions = ">=1.9.0"
+
+[tool.pixi.feature.coverage.dependencies]
+coveralls = ">=4.0.0"
+
+[tool.pixi.feature.coverage.tasks]
+coverage-erase = { cmd = "coverage erase" }
+coverage-run = { cmd = "coverage run -m unittest discover --failfast", depends-on = ["coverage-erase"] }
+coverage = { cmd = "coverage report --include=\"pink/*\"", depends-on = ["coverage-run"] }
+coveralls = { cmd = "coveralls --service=github" }
+
+[tool.pixi.feature.docs.dependencies]
+sphinx = ">=7.2.2"
+sphinx-rtd-theme = "*"
+sphinx-favicon = "*"
+sphinx-autodoc-typehints = "*"
+
+[tool.pixi.feature.docs.pypi-dependencies]
+sphinx-mathjax-offline = "*"
+
+[tool.pixi.feature.docs.tasks]
+docs-build = { cmd = "sphinx-build doc/ _build -W" }
+docs-open = { cmd = "xdg-open _build/index.html", depends-on = "docs-build" }
+
+[tool.pixi.feature.lint]
+tasks.lint = { depends-on = ["mypy", "pylint", "ruff"] }
+
+[tool.pixi.feature.mypy.dependencies]
+mypy = ">=0.812"
+
+[tool.pixi.feature.mypy.tasks]
+mypy = "mypy pink --ignore-missing-imports"
+
+[tool.pixi.feature.py39.dependencies]
+python = "3.9.*"
+
+[tool.pixi.feature.py310.dependencies]
+python = "3.10.*"
+
+[tool.pixi.feature.py311.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.py312.dependencies]
+python = "3.12.*"
+
+[tool.pixi.feature.pylint.dependencies]
+pylint = ">=2.8.2"
+
+[tool.pixi.feature.pylint.tasks]
+pylint = "pylint pink --exit-zero --rcfile=pyproject.toml"
+
+[tool.pixi.feature.ruff.dependencies]
+ruff = ">=0.4.3"
+
+[tool.pixi.feature.ruff.tasks]
+ruff = "ruff check pink && ruff format --check pink"
+
+[tool.pixi.feature.test.dependencies]
+daqp = "*"
+osqp = "*"
+proxsuite = "*"
+scs = "*"
+
+[tool.pixi.feature.test.tasks]
+test = "python -m unittest discover --failfast"
+
+[tool.pixi.environments]
+coverage = { features = ["py312", "coverage"], solve-group = "py312" }
+docs = { features = ["py312", "docs"], solve-group = "py312" }
+lint = { features = ["py312", "lint", "mypy", "pylint", "ruff"], solve-group = "py312" }
+test-py310 = { features = ["py310", "test"], solve-group = "py310" }
+test-py311 = { features = ["py311", "test"], solve-group = "py311" }
+test-py312 = { features = ["py312", "test"], solve-group = "py312" }
+test-py39 = { features = ["py39", "test"], solve-group = "py39" }
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = [
+    # pyflakes
+    "F",
+    # pycodestyle
+    "E",
+    "W",
+    # isort
+    "I001",
+    # pydocstyle
+    "D"
+]
+ignore = [
+    "D401",  # good for methods but not for class docstrings
+    "D405",  # British-style section names are also "proper"!
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
