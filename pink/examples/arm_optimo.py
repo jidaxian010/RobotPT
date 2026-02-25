@@ -199,3 +199,6 @@ if __name__ == "__main__":
         viewer["end_effector"].set_transform(ee_tf_vis.np)
 
         rate.sleep()
+
+
+        

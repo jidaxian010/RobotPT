@@ -1,3 +1,4 @@
+import csv
 import sys
 from pathlib import Path
 import bisect
@@ -6,6 +7,7 @@ import argparse
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation as ScipyRotation
 
 # Allow imports from posEstimate/ regardless of working directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,8 +34,10 @@ IS_THIRD_PERSON = True
 SKIP_FIRST_N = 0
 SKIP_LAST_N = 0
 EXTRACT_RGB_VIDEO = True  # Set False to reuse an existing VIDEO_PATH
-CROP = (3, 10)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
+CROP = (5, 10)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
 CROP_UNIT = "s"           # "s" or "frame"
+SHOW_VIDEO = False        # OpenCV popup playback window
+SHOW_IMAGE = True        # Matplotlib plots
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL = 11  # odd, frames
 SMOOTH_SIGMA = 4        # frames
@@ -274,7 +278,7 @@ marker_3d_edges = np.array(
 
 
 class RosbagGripperPoseTracker:
-    def __init__(self, show_popup=True):
+    def __init__(self, show_popup=True, show_image=True):
         self.video_reader = RosbagVideoReader(
             BAG_PATH,
             VIDEO_PATH,
@@ -291,6 +295,7 @@ class RosbagGripperPoseTracker:
         self.input_video_fps = 30.0
         self.output_video_fps = 30.0
         self.show_popup = bool(show_popup)
+        self.show_image = bool(show_image)
         self.crop = CROP
         self.crop_unit = CROP_UNIT
         self.frame_offset = 0
@@ -643,7 +648,65 @@ class RosbagGripperPoseTracker:
             annotated_tmp_path.replace(VIDEO_PATH)
             print(f"Saved annotated playback video to {VIDEO_PATH}")
 
+    def save_poses_csv(self, output_dir=None):
+        """
+        Save the gripper CoM trajectory relative to the first valid frame.
+
+        Poses are expressed in the initial gripper frame:
+            pos   = R0.T @ (t_cam_t - t_cam_0)   [mm], first row = 0,0,0
+            euler = Euler XYZ of R0.T @ R_cam_t   [rad], first row = 0,0,0
+
+        The CSV is directly readable by pink/examples/arm_optimo.py.
+
+        Returns the Path of the written file, or None on failure.
+        """
+        if output_dir is None:
+            output_dir = VIDEO_PATH.parent
+        output_dir = Path(output_dir)
+
+        valid = [(i, p) for i, p in enumerate(self.gripper_poses) if p is not None]
+        if not valid:
+            print("  No valid gripper poses to save.")
+            return None
+
+        _, first = valid[0]
+        R0  = first["rotation"]
+        t0  = first["position"]
+        ts0 = float(self.rgb_timestamps[first["frame_idx"]])
+
+        csv_path = output_dir / f"{VIDEO_PATH.stem}_gripper_motion_initial_frame_6d.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["t", "frame",
+                             "pos_x", "pos_y", "pos_z",
+                             "orient_x", "orient_y", "orient_z"])
+            first_valid_idx = valid[0][0]
+            for idx, pose in valid:
+                ts    = float(self.rgb_timestamps[pose["frame_idx"]]) - ts0
+                pos   = R0.T @ (pose["position"] - t0)
+                R_rel = R0.T @ pose["rotation"]
+                euler = ScipyRotation.from_matrix(R_rel).as_euler("xyz")
+
+                # Guarantee the initial pose is exactly zero in the exported body-frame motion.
+                if idx == first_valid_idx:
+                    ts = 0.0
+                    pos = np.zeros(3, dtype=np.float64)
+                    euler = np.zeros(3, dtype=np.float64)
+
+                writer.writerow([
+                    round(ts, 6),
+                    pose["frame_idx"],
+                    round(pos[0], 3), round(pos[1], 3), round(pos[2], 3),
+                    round(euler[0], 6), round(euler[1], 6), round(euler[2], 6),
+                ])
+
+        print(f"  Saved gripper 6D motion in initial gripper frame: {csv_path}")
+        return csv_path
+
     def plot_results(self):
+        if not self.show_image:
+            print("Skipping plots (SHOW_IMAGE=False).")
+            return
         poses_for_plot = {
             mid: poses for mid, poses in self.all_raw_poses.items() if any(p is not None for p in poses)
         }
@@ -664,6 +727,11 @@ class RosbagGripperPoseTracker:
         depth_queries, query_refs = self.detect_markers_and_collect_depth_queries()
         self.apply_depth_lookup(depth_queries, query_refs)
         self.build_pose_outputs()
+        csv_path = self.save_poses_csv()
+        if csv_path is not None:
+            arm_script = Path(__file__).resolve().parents[2] / "pink/examples/arm_optimo.py"
+            print(f"\nTo replay on the robot arm, run:")
+            print(f"  python {arm_script} {csv_path}")
         self.render_and_save_annotated_video()
         self.plot_results()
 
@@ -676,7 +744,8 @@ def main():
         help="Do not show the OpenCV playback window while processing/saving video.",
     )
     args = parser.parse_args()
-    RosbagGripperPoseTracker(show_popup=not args.no_popup).run()
+    show_popup = SHOW_VIDEO and (not args.no_popup)
+    RosbagGripperPoseTracker(show_popup=show_popup, show_image=SHOW_IMAGE).run()
 
 
 if __name__ == "__main__":

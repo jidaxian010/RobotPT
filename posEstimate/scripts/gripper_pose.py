@@ -839,8 +839,12 @@ def main():
     avg_poses = g.compute_gripper_poses_averaged()
     avg_out   = denoise_pose_list(avg_poses) if g.denoise else avg_poses
     if any(p is not None for p in avg_out):
-        g.save_fused_poses_csv(avg_out)
+        csv_path = g.save_fused_poses_csv(avg_out)
         g.save_annotated_video(avg_poses)   # annotated video always uses raw poses
+        if csv_path is not None:
+            arm_script = Path(__file__).resolve().parents[2] / "pink/examples/arm_optimo.py"
+            print(f"\nTo replay on the robot arm, run:")
+            print(f"  python {arm_script} {csv_path}")
         plot_gripper_camera_frame(avg_out, g.rgb_timestamps)  # plot 2
         plot_gripper_body_frame(avg_out, g.rgb_timestamps)    # plot 3
     else:
