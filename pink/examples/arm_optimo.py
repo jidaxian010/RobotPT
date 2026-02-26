@@ -9,9 +9,11 @@
 import argparse
 import csv
 import time
+from pathlib import Path
 import numpy as np
 import qpsolvers
 from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
+import matplotlib.pyplot as plt
 
 import meshcat_shapes
 import pink
@@ -41,8 +43,14 @@ ROOT_JOINT   = None
 #   orient_xyz – Euler XYZ angles (rad) relative to initial gripper orientation
 _DEFAULT_CSV = (
     "/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data"
-    "/pose2_com_trajectory_fused.csv"
+    "/pose3.csv"
 )
+
+# Run behavior flags (edit in code; no CLI flags needed)
+RUN_MODE = "once"  # "loop" or "once"
+JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
+PLOT_SAVED_JOINT_TRAJ = True
+TIME_SCALE = 0.8  # < 1.0 slows replay; 1.0 = original recorded speed
 
 
 
@@ -87,6 +95,46 @@ def read_poses(path):
     return poses
 
 
+def save_joint_trajectory_csv(csv_path, records):
+    """Save solved joint trajectory records to CSV."""
+    if not records:
+        print("No solved joint trajectory records to save.")
+        return None
+
+    q_dim = len(records[0]["q"])
+    header = ["t", "sample_idx"] + [f"joint{i+1}" for i in range(q_dim)]
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for rec in records:
+            writer.writerow(
+                [round(rec["t"], 6), rec["sample_idx"]]
+                + [round(float(v), 8) for v in rec["q"]]
+            )
+    print(f"Saved solved joint trajectory: {csv_path}")
+    return csv_path
+
+
+def plot_joint_trajectory(records):
+    """Plot solved joint trajectories over time."""
+    if not records:
+        print("No solved joint trajectory records to plot.")
+        return
+
+    t = np.array([r["t"] for r in records], dtype=float)
+    q = np.array([r["q"] for r in records], dtype=float)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(t, q, linewidth=1.2)
+    ax.set_title("Solved Joint Trajectory")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("joint position (rad)")
+    ax.grid(True, linewidth=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Replay a gripper trajectory on the Optimo arm."
@@ -114,7 +162,7 @@ if __name__ == "__main__":
     end_effector_task = FrameTask(
         EE_NAME,
         position_cost=1.0,
-        orientation_cost=0.0,
+        orientation_cost=0.5,
         lm_damping=1.0,
     )
     posture_task = PostureTask(cost=1e-3)
@@ -142,7 +190,7 @@ if __name__ == "__main__":
     if "daqp" in qpsolvers.available_solvers:
         solver = "daqp"
 
-    rate = RateLimiter(frequency=200.0, warn=False)
+    rate = RateLimiter(frequency=60.0, warn=False)
     dt   = rate.period
 
     # Load trajectory
@@ -172,10 +220,19 @@ if __name__ == "__main__":
     # This corresponds to a local-frame rotation of -90 deg about z.
     R_frame_offset = ScipyRotation.from_euler("z", -90.0, degrees=True).as_matrix()
 
-    # Replay loop — interpolates at 200 Hz, cycles indefinitely
-    t_start = time.time()
+    # Replay loop — interpolates at controller rate.
+    # Use a simulation clock (dt accumulation) so the saved joint trajectory matches
+    # exactly what the simulator executed, independent of wall-clock jitter.
+    sim_time = 0.0
+    solved_joint_records = []
     while True:
-        t_elapsed = (time.time() - t_start) % T_total
+        replay_time = sim_time * TIME_SCALE
+        if RUN_MODE == "once":
+            if replay_time > T_total:
+                break
+            t_elapsed = replay_time
+        else:
+            t_elapsed = replay_time % T_total
 
         pos = np.array([np.interp(t_elapsed, traj_t, traj_pos[:, i])
                         for i in range(3)])
@@ -193,12 +250,35 @@ if __name__ == "__main__":
         configuration.integrate_inplace(velocity, dt)
         viz.display(configuration.q)
 
+        if RUN_MODE == "once":
+            solved_joint_records.append(
+                {
+                    # Save the exact replay-time index used to generate the target
+                    # for this displayed simulator step.
+                    "t": float(t_elapsed),
+                    "sample_idx": len(solved_joint_records),
+                    "q": configuration.q.copy(),
+                }
+            )
+
         viewer["end_effector_target"].set_transform(target.np)
         ee_tf = configuration.get_transform_frame_to_world(EE_NAME)
         ee_tf_vis = pin.SE3(ee_tf.rotation @ R_frame_offset, ee_tf.translation)
         viewer["end_effector"].set_transform(ee_tf_vis.np)
 
         rate.sleep()
+        sim_time += dt
+
+    if RUN_MODE == "once":
+        default_save_dir = Path(_DEFAULT_CSV).parent
+        out_path = (
+            Path(JOINT_TRAJ_OUT)
+            if JOINT_TRAJ_OUT is not None
+            else default_save_dir / f"{Path(PATH_TO_POSES).stem}_solved_qs.csv"
+        )
+        save_joint_trajectory_csv(out_path, solved_joint_records)
+        if PLOT_SAVED_JOINT_TRAJ:
+            plot_joint_trajectory(solved_joint_records)
 
 
         

@@ -27,20 +27,20 @@ from denoise import denoise_pose_list
 MARKER_SIZE_METERS = 0.0725
 
 # Rosbag/video config (same RosbagVideoReader path/topic conventions as gripper_pose.py)
-DATA_NAME = "pose2"
+DATA_NAME = "pose3"
 BAG_PATH = Path(f"/home/jdx/Downloads/{DATA_NAME}")
 VIDEO_PATH = Path(f"posEstimate/data/{DATA_NAME}.mp4")
 IS_THIRD_PERSON = True
 SKIP_FIRST_N = 0
 SKIP_LAST_N = 0
 EXTRACT_RGB_VIDEO = True  # Set False to reuse an existing VIDEO_PATH
-CROP = (5, 10)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
+CROP = (2, 15)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
 CROP_UNIT = "s"           # "s" or "frame"
 SHOW_VIDEO = False        # OpenCV popup playback window
 SHOW_IMAGE = True        # Matplotlib plots
 SMOOTH_GRIPPER_POSE = True
-SMOOTH_MED_KERNEL = 11  # odd, frames
-SMOOTH_SIGMA = 4        # frames
+SMOOTH_MED_KERNEL = 15  # odd, frames
+SMOOTH_SIGMA = 10        # frames
 
 # Camera intrinsics (copied from gripper_pose.py; 848x480 RealSense stream)
 _FX = 602.6597900390625
@@ -674,7 +674,7 @@ class RosbagGripperPoseTracker:
         t0  = first["position"]
         ts0 = float(self.rgb_timestamps[first["frame_idx"]])
 
-        csv_path = output_dir / f"{VIDEO_PATH.stem}_gripper_motion_initial_frame_6d.csv"
+        csv_path = output_dir / f"{DATA_NAME}.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["t", "frame",
