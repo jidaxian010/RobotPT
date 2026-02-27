@@ -27,20 +27,20 @@ from denoise import denoise_pose_list
 MARKER_SIZE_METERS = 0.0725
 
 # Rosbag/video config (same RosbagVideoReader path/topic conventions as gripper_pose.py)
-DATA_NAME = "pose3"
+DATA_NAME = "pose4"
 BAG_PATH = Path(f"/home/jdx/Downloads/{DATA_NAME}")
 VIDEO_PATH = Path(f"posEstimate/data/{DATA_NAME}.mp4")
 IS_THIRD_PERSON = True
 SKIP_FIRST_N = 0
 SKIP_LAST_N = 0
 EXTRACT_RGB_VIDEO = True  # Set False to reuse an existing VIDEO_PATH
-CROP = (2, 15)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
+CROP = (5, -7)            # (start, end), seconds when CROP_UNIT == "s"; end<0 means to end
 CROP_UNIT = "s"           # "s" or "frame"
 SHOW_VIDEO = False        # OpenCV popup playback window
 SHOW_IMAGE = True        # Matplotlib plots
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL = 15  # odd, frames
-SMOOTH_SIGMA = 10        # frames
+SMOOTH_SIGMA = 20        # frames
 
 # Camera intrinsics (copied from gripper_pose.py; 848x480 RealSense stream)
 _FX = 602.6597900390625

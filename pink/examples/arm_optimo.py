@@ -43,14 +43,16 @@ ROOT_JOINT   = None
 #   orient_xyz – Euler XYZ angles (rad) relative to initial gripper orientation
 _DEFAULT_CSV = (
     "/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data"
-    "/pose3.csv"
+    "/pose4.csv"
 )
 
 # Run behavior flags (edit in code; no CLI flags needed)
 RUN_MODE = "once"  # "loop" or "once"
 JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
 PLOT_SAVED_JOINT_TRAJ = True
-TIME_SCALE = 0.8  # < 1.0 slows replay; 1.0 = original recorded speed
+TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+WARMUP_SKIP_SEC = 0.3  # in RUN_MODE="once", don't save the first N seconds of replay
+TRJ_HZ = 50.0  # output .trj frequency (frames are dropped/interpolated from solver Hz)
 
 
 
@@ -117,6 +119,45 @@ def save_joint_trajectory_csv(csv_path, records):
     return csv_path
 
 
+def save_trj(trj_path, records, target_hz=50.0):
+    """Save solved joint trajectory as a .trj file, resampled to target_hz."""
+    if not records:
+        print("No solved joint trajectory records to save.")
+        return None
+
+    t_arr = np.array([r["t"] for r in records], dtype=float)
+    q_arr = np.array([r["q"] for r in records], dtype=float)
+
+    duration = t_arr[-1] - t_arr[0]
+    if duration <= 0:
+        print("Warning: zero-duration trajectory, skipping .trj save.")
+        return None
+
+    n_frames = int(duration * target_hz) + 1
+    t_new = np.linspace(t_arr[0], t_arr[-1], n_frames)
+
+    n_joints = q_arr.shape[1]
+    q_new = np.zeros((n_frames, n_joints))
+    for j in range(n_joints):
+        q_new[:, j] = np.interp(t_new, t_arr, q_arr[:, j])
+
+    actual_hz = (n_frames - 1) / duration
+
+    trj_path = Path(trj_path)
+    trj_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(trj_path, "w") as f:
+        f.write(f"{n_frames} [size]\n")
+        f.write(f"{duration:.6f} [sec]\n")
+        f.write(f"{actual_hz:.6f} [Hz]\n")
+        f.write("1 [type]\n")
+        for row in q_new:
+            line = " ".join(f"{v:.6f}" for v in row) + " ,"
+            f.write(line + "\n")
+
+    print(f"Saved .trj: {trj_path}  ({n_frames} frames @ {actual_hz:.3f} Hz)")
+    return trj_path
+
+
 def plot_joint_trajectory(records):
     """Plot solved joint trajectories over time."""
     if not records:
@@ -133,6 +174,33 @@ def plot_joint_trajectory(records):
     ax.grid(True, linewidth=0.4)
     plt.tight_layout()
     plt.show()
+
+
+def print_joint_trajectory_debug(records, q_init, n=5):
+    """Print raw solved joint samples and initial-step deltas for debugging."""
+    if not records:
+        print("No solved joint records to print.")
+        return
+
+    q_init = np.asarray(q_init, dtype=float).copy()
+    print("\nRaw joint debug")
+    print(f"Initial q (before replay): {np.round(q_init, 6)}")
+
+    n_show = min(n, len(records))
+    for i in range(n_show):
+        rec = records[i]
+        q = np.asarray(rec["q"], dtype=float)
+        dq_from_init = q - q_init
+        print(
+            f"  sample {i:02d}  t={rec['t']:.4f}s"
+            f"  q={np.round(q, 6)}"
+            f"  dq_init={np.round(dq_from_init, 6)}"
+        )
+
+    if len(records) >= 2:
+        q0 = np.asarray(records[0]["q"], dtype=float)
+        q1 = np.asarray(records[1]["q"], dtype=float)
+        print(f"First-step delta (sample1 - sample0): {np.round(q1 - q0, 6)}")
 
 
 if __name__ == "__main__":
@@ -168,18 +236,30 @@ if __name__ == "__main__":
     posture_task = PostureTask(cost=1e-3)
     damping_task = DampingTask(cost=1e-3)
 
+    # q_ref = custom_configuration_vector(
+    #     robot,
+    #     joint1=0.0,
+    #     joint2=2.85,
+    #     joint3=0.0,
+    #     joint4=-1.25,
+    #     joint5=0.0,
+    #     joint6=-1.66,
+    #     joint7=0.0,
+    # )
+
     q_ref = custom_configuration_vector(
         robot,
         joint1=0.0,
         joint2=2.85,
         joint3=0.0,
-        joint4=-1.25,
+        joint4=-1.58,
         joint5=0.0,
-        joint6=-1.66,
+        joint6=-1.43,
         joint7=0.0,
     )
 
     configuration = pink.Configuration(robot.model, robot.data, q_ref)
+    q_init_for_debug = configuration.q.copy()
     tasks = [end_effector_task, posture_task]
     for task in tasks:
         task.set_target_from_configuration(configuration)
@@ -225,6 +305,16 @@ if __name__ == "__main__":
     # exactly what the simulator executed, independent of wall-clock jitter.
     sim_time = 0.0
     solved_joint_records = []
+    if RUN_MODE == "once" and WARMUP_SKIP_SEC <= 0:
+        # Include the true initial simulator state so saved/plot trajectories
+        # start from the actual robot configuration before the first IK step.
+        solved_joint_records.append(
+            {
+                "t": 0.0,
+                "sample_idx": 0,
+                "q": configuration.q.copy(),
+            }
+        )
     while True:
         replay_time = sim_time * TIME_SCALE
         if RUN_MODE == "once":
@@ -250,7 +340,7 @@ if __name__ == "__main__":
         configuration.integrate_inplace(velocity, dt)
         viz.display(configuration.q)
 
-        if RUN_MODE == "once":
+        if RUN_MODE == "once" and float(t_elapsed) >= float(WARMUP_SKIP_SEC):
             solved_joint_records.append(
                 {
                     # Save the exact replay-time index used to generate the target
@@ -276,7 +366,10 @@ if __name__ == "__main__":
             if JOINT_TRAJ_OUT is not None
             else default_save_dir / f"{Path(PATH_TO_POSES).stem}_solved_qs.csv"
         )
+        print_joint_trajectory_debug(solved_joint_records, q_init_for_debug, n=8)
         save_joint_trajectory_csv(out_path, solved_joint_records)
+        trj_path = default_save_dir / f"{Path(PATH_TO_POSES).stem}.trj"
+        save_trj(trj_path, solved_joint_records, target_hz=TRJ_HZ)
         if PLOT_SAVED_JOINT_TRAJ:
             plot_joint_trajectory(solved_joint_records)
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Easier naming (edit one value)
-DATA_NAME = "pose3"
+DATA_NAME = "pose4"
 
 def csv_to_trj(input_csv, output_trj, original_hz=200, target_hz=1000, cutoff_hz=50, filter_order=4):
     """
@@ -90,12 +90,12 @@ def csv_to_trj(input_csv, output_trj, original_hz=200, target_hz=1000, cutoff_hz
         f.write(f"{num_samples} [size]\n")
         f.write(f"{actual_duration:.6f} [sec]\n")
         f.write(f"{actual_hz:.6f} [Hz]\n")
-        f.write("\n")
-        
+        f.write("1 [type]\n")
+
         # Write data rows
         for row in interpolated_data:
-            # Format: 7 joint values separated by spaces, ending with comma
-            line = ' '.join([f"{val:.6f}" for val in row]) + ','
+            # Format: 7 joint values separated by spaces, ending with space+comma
+            line = ' '.join([f"{val:.6f}" for val in row]) + ' ,'
             f.write(line + '\n')
     
     print(f"Conversion complete!")
@@ -134,7 +134,7 @@ if __name__ == "__main__":
         input_csv,
         output_trj,
         original_hz=100,
-        target_hz=1000,
+        target_hz=200,
         cutoff_hz=1,
         filter_order=6,
     )
