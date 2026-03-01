@@ -241,8 +241,8 @@ class HumanPose:
 
 def main():
     h = HumanPose(
-        bagpath="/home/jdx/Downloads/gripper1",
-        output_path="posEstimate/data/gripper1_pose.mp4",
+        bagpath="/home/jdx/Downloads/pose1",
+        output_path="posEstimate/data/pose1_human.mp4",
     )
     h.run()
 

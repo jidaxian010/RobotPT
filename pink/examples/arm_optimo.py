@@ -37,22 +37,55 @@ URDF_PATH    = "/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_des
 PACKAGE_DIRS = ["/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_description"]
 ROOT_JOINT   = None
 
+# Map recorded gripper-frame data into the simulator EE frame:
+# gripper +y -> EE +x
+# gripper +x -> EE -y
+# gripper +z -> EE +z
+R_GRIPPER_TO_EE = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+
 # CSV produced by RosbagGripperPoseTracker.save_poses_csv()
 # Columns: t, frame, pos_x, pos_y, pos_z, orient_x, orient_y, orient_z
 #   pos_xyz    – displacement in mm from first valid frame, in initial gripper frame
 #   orient_xyz – Euler XYZ angles (rad) relative to initial gripper orientation
 _DEFAULT_CSV = (
     "/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data"
-    "/pose4.csv"
+    "/aba.csv"
 )
 
 # Run behavior flags (edit in code; no CLI flags needed)
-RUN_MODE = "once"  # "loop" or "once"
+RUN_MODE = "loop"  # "loop" or "once"
 JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
 PLOT_SAVED_JOINT_TRAJ = True
 TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 WARMUP_SKIP_SEC = 0.3  # in RUN_MODE="once", don't save the first N seconds of replay
 TRJ_HZ = 50.0  # output .trj frequency (frames are dropped/interpolated from solver Hz)
+
+# ── Start configuration ──────────────────────────────────────────────────────
+# Two ways to define where the robot's EE starts before replaying the trajectory:
+#
+#   Mode A – joint angles (current default):
+#     Set START_EE_POSITION = None.  q_ref joint angles are used directly.
+#
+#   Mode B – world-frame EE position:
+#     Set START_EE_POSITION to an [x, y, z] vector (meters, robot world frame).
+#     IK pre-solve will find joint angles that place the EE at that position.
+#     Workflow:
+#       1. Run once with START_EE_POSITION=None — note the printed "Initial EE position".
+#       2. Decide where you want the EE to start and set START_EE_POSITION.
+#       3. Optionally set START_EE_ROTATION (3×3 matrix) to fix orientation too.
+#          Leave None to keep orientation from q_ref.
+#
+# To use camera-frame gripper data as a start hint (requires calibration):
+#   T_cam_to_world = <your camera→robot-base 4×4 transform>
+#   gripper_pos_cam = <row-0 absolute camera-frame position from CSV, in meters>
+#   START_EE_POSITION = (T_cam_to_world[:3, :3] @ gripper_pos_cam + T_cam_to_world[:3, 3])
+START_EE_POSITION = None        # None → use q_ref directly; or np.array([x, y, z])
+START_EE_ROTATION = None        # None → keep orientation from q_ref; or np.ndarray(3,3)
+IK_PRESOLVE_ITERS = 800         # IK gradient steps to converge before replay
 
 
 
@@ -62,6 +95,8 @@ def read_poses(path):
 
     Positions are converted mm → m.
     Euler XYZ angles are converted to rotation matrices.
+    Loaded poses are remapped from the recorded gripper frame into the
+    simulator end-effector frame.
 
     Returns
     -------
@@ -83,12 +118,14 @@ def read_poses(path):
                     float(row["orient_y"]),
                     float(row["orient_z"]),
                 ])
-                R = ScipyRotation.from_euler("xyz", euler).as_matrix()
+                R_gripper = ScipyRotation.from_euler("xyz", euler).as_matrix()
+                pos_ee = R_GRIPPER_TO_EE @ pos_m
+                R_ee = R_GRIPPER_TO_EE @ R_gripper @ R_GRIPPER_TO_EE.T
 
                 poses.append({
                     "t":        float(row["t"]),
-                    "position": pos_m,
-                    "rotation": R,
+                    "position": pos_ee,
+                    "rotation": R_ee,
                 })
     except FileNotFoundError:
         print(f"Error: CSV not found at {path}")
@@ -247,28 +284,71 @@ if __name__ == "__main__":
     #     joint7=0.0,
     # )
 
-    q_ref = custom_configuration_vector(
+    # q_ref = custom_configuration_vector(
+    #     robot,
+    #     joint1=0.0,
+    #     joint2=2.85,
+    #     joint3=0.0,
+    #     joint4=-1.58,
+    #     joint5=0.0,
+    #     joint6=-1.43,
+    #     joint7=0.0,
+    # )
+
+    q_ref = custom_configuration_vector( #aba
         robot,
         joint1=0.0,
-        joint2=2.85,
+        joint2=2.69,
         joint3=0.0,
-        joint4=-1.58,
+        joint4=-1.87,
         joint5=0.0,
-        joint6=-1.43,
+        joint6=0.69,
         joint7=0.0,
     )
+    
+    solver = qpsolvers.available_solvers[0]
+    if "daqp" in qpsolvers.available_solvers:
+        solver = "daqp"
 
     configuration = pink.Configuration(robot.model, robot.data, q_ref)
+
+    # ── Mode B: IK pre-solve to reach a desired world-frame EE position ──────
+    if START_EE_POSITION is not None:
+        pre_target = configuration.get_transform_frame_to_world(EE_NAME)
+        pre_target = pin.SE3(
+            START_EE_ROTATION if START_EE_ROTATION is not None else pre_target.rotation.copy(),
+            np.asarray(START_EE_POSITION, dtype=float),
+        )
+        pre_ee_task = FrameTask(
+            EE_NAME,
+            position_cost=1.0,
+            orientation_cost=0.1 if START_EE_ROTATION is not None else 0.0,
+            lm_damping=1.0,
+        )
+        pre_ee_task.set_target(pre_target)
+        pre_posture = PostureTask(cost=1e-3)
+        pre_posture.set_target(q_ref)
+        pre_tasks = [pre_ee_task, pre_posture, DampingTask(cost=1e-3)]
+        dt_pre = 1.0 / 200.0
+        for _ in range(IK_PRESOLVE_ITERS):
+            vel = solve_ik(configuration, pre_tasks, dt_pre, solver=solver)
+            configuration.integrate_inplace(vel, dt_pre)
+        actual_ee = configuration.get_transform_frame_to_world(EE_NAME).translation
+        print(f"Pre-solve: target={np.asarray(START_EE_POSITION).round(4)}, "
+              f"actual EE={actual_ee.round(4)}")
+        print(f"Pre-solved joints (copy to q_ref to skip pre-solve next time):")
+        jnames = [robot.model.names[i] for i in range(1, robot.model.njoints)]
+        for name, val in zip(jnames, configuration.q[7:] if len(configuration.q) > 7 else configuration.q):
+            print(f"  {name}={val:.6f}")
+        viz.display(configuration.q)
+    # ─────────────────────────────────────────────────────────────────────────
+
     q_init_for_debug = configuration.q.copy()
     tasks = [end_effector_task, posture_task]
     for task in tasks:
         task.set_target_from_configuration(configuration)
     tasks.append(damping_task)
     viz.display(configuration.q)
-
-    solver = qpsolvers.available_solvers[0]
-    if "daqp" in qpsolvers.available_solvers:
-        solver = "daqp"
 
     rate = RateLimiter(frequency=60.0, warn=False)
     dt   = rate.period
@@ -295,10 +375,10 @@ if __name__ == "__main__":
     initial_position  = initial_transform.translation.copy()
     initial_rotation  = initial_transform.rotation.copy()
     print(f"Initial EE position: {initial_position.round(3)}")
-    # Frame-axis offset for both EE and target visuals/motion:
-    # desired: x points left, y points front  (from x=front, y=right)
-    # This corresponds to a local-frame rotation of -90 deg about z.
-    R_frame_offset = ScipyRotation.from_euler("z", -90.0, degrees=True).as_matrix()
+    # Frame-axis offset: maps CSV gripper frame → robot EE frame.
+    # CSV frame: y=up, z=out-of-surface (forward).
+    # EE frame (with current q_ref): y=up, z=forward → frames are aligned.
+    R_frame_offset = np.eye(3)
 
     # Replay loop — interpolates at controller rate.
     # Use a simulation clock (dt accumulation) so the saved joint trajectory matches
