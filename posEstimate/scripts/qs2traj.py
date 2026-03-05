@@ -29,17 +29,21 @@ def csv_to_trj(input_csv, output_trj, original_hz=200, target_hz=1000, cutoff_hz
     print(f"Reading {input_csv}...")
     df = pd.read_csv(input_csv)
     
-    # Extract joint data (ignore timestamp column if it exists)
+    # Extract joint data and timestamps
     joint_cols = [col for col in df.columns if col.startswith('joint')]
     joint_data = df[joint_cols].values
-    
-    # Generate timestamps based on specified original_hz
-    original_samples = len(joint_data)
-    original_duration = (original_samples - 1) / original_hz
-    timestamps = np.linspace(0, original_duration, original_samples)
-    
-    print(f"Original data: {original_samples} samples over {original_duration:.3f} seconds")
-    print(f"Using specified original frequency: {original_hz} Hz")
+
+    if 't' in df.columns:
+        timestamps = df['t'].values - df['t'].values[0]   # zero-base
+        original_duration = float(timestamps[-1])
+        original_samples = len(joint_data)
+        print(f"Original data: {original_samples} samples over {original_duration:.3f} seconds (from 't' column)")
+    else:
+        original_samples = len(joint_data)
+        original_duration = (original_samples - 1) / original_hz
+        timestamps = np.linspace(0, original_duration, original_samples)
+        print(f"Original data: {original_samples} samples over {original_duration:.3f} seconds")
+        print(f"Using specified original frequency: {original_hz} Hz")
     
     # Create interpolation functions for each joint
     print(f"Interpolating to {target_hz} Hz...")

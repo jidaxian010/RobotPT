@@ -68,37 +68,17 @@ SMOOTH_SIGMA        = 20
 MARKER_SIZE_METERS = 0.0725
 
 # --- Human pose rule book ---
-POSE_RULE_JOINTS = [11, 12, 13, 14, 15, 16, 23, 24]
+POSE_RULE_JOINTS = [11, 12, 13, 14, 23, 24]
 VIS_THRESHOLD    = 0.3
 
 JOINT_ANGLE_TRIPLETS = {
-    "left_elbow":       (11, 13, 15),
-    "right_elbow":      (12, 14, 16),
-    "left_shoulder":    (12, 11, 13),
-    "right_shoulder":   (11, 12, 14),
-    "left_arm_torso":   (23, 11, 13),
-    "right_arm_torso":  (24, 12, 14),
-    "torso_left":       (24, 23, 11),
-    "torso_right":      (23, 24, 12),
+    "right_arm_torso": (14, 12, 24),
+    "left_arm_torso":  (13, 11, 23),
 }
 
 _TRIPLET_DESCRIPTIONS = {
-    "left_elbow":       "left shoulder – left elbow – left wrist",
-    "right_elbow":      "right shoulder – right elbow – right wrist",
-    "left_shoulder":    "right shoulder – left shoulder – left elbow (arm vs shoulder line)",
-    "right_shoulder":   "left shoulder – right shoulder – right elbow (arm vs shoulder line)",
-    "left_arm_torso":   "left hip – left shoulder – left elbow (arm vs trunk)",
-    "right_arm_torso":  "right hip – right shoulder – right elbow (arm vs trunk)",
-    "torso_left":       "right hip – left hip – left shoulder (hip bends to left side)",
-    "torso_right":      "left hip – right hip – right shoulder (hip bends to right side)",
-}
-
-SEGMENT_ANGLE_PAIRS = {
-    "torso_twist": ((11, 12), (23, 24)),
-}
-
-_SEGMENT_DESCRIPTIONS = {
-    "torso_twist": "angle between shoulder axis (11→12) and hip axis (23→24); ~0° = no twist",
+    "right_arm_torso": "right elbow – right shoulder – right hip (arm elevation vs trunk)",
+    "left_arm_torso":  "left elbow – left shoulder – left hip (arm elevation vs trunk)",
 }
 
 MODEL_PATH = str(Path(__file__).resolve().parent.parent /
@@ -698,11 +678,8 @@ class TwoCamProcessor:
 
         h, w = frame_hw
         all_joints = set(POSE_RULE_JOINTS)
-        for (ja, jb), (jc, jd) in SEGMENT_ANGLE_PAIRS.values():
-            all_joints.update([ja, jb, jc, jd])
 
         triplet_samples = {n: [] for n in JOINT_ANGLE_TRIPLETS}
-        segment_samples = {n: [] for n in SEGMENT_ANGLE_PAIRS}
 
         for frame_data in lm_arr:
             if np.all(np.isnan(frame_data)):
@@ -723,18 +700,6 @@ class TwoCamProcessor:
                     continue
                 triplet_samples[name].append(_angle_at_joint_deg(A, B, C))
 
-            for name, ((ja, jb), (jc, jd)) in SEGMENT_ANGLE_PAIRS.items():
-                A, B = joint_3d.get(ja), joint_3d.get(jb)
-                C, D = joint_3d.get(jc), joint_3d.get(jd)
-                if A is None or B is None or C is None or D is None:
-                    continue
-                seg1 = np.asarray(B) - np.asarray(A)
-                seg2 = np.asarray(D) - np.asarray(C)
-                cos_t = np.dot(seg1, seg2) / (np.linalg.norm(seg1) * np.linalg.norm(seg2) + 1e-8)
-                segment_samples[name].append(
-                    float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
-                )
-
         def _stats(samples, joints_field, desc_field):
             if not samples:
                 return None
@@ -753,14 +718,8 @@ class TwoCamProcessor:
             n: s for n, samps in triplet_samples.items()
             if (s := _stats(samps, list(JOINT_ANGLE_TRIPLETS[n]), _TRIPLET_DESCRIPTIONS[n]))
         }
-        segment_stats = {}
-        for name, samps in segment_samples.items():
-            (ja, jb), (jc, jd) = SEGMENT_ANGLE_PAIRS[name]
-            s = _stats(samps, [[ja, jb], [jc, jd]], _SEGMENT_DESCRIPTIONS[name])
-            if s:
-                segment_stats[name] = s
 
-        if not triplet_stats and not segment_stats:
+        if not triplet_stats:
             print("  Rule book: no valid angle samples found.")
             return
 
@@ -776,17 +735,15 @@ class TwoCamProcessor:
             "joints_monitored":  POSE_RULE_JOINTS,
             "n_frames_analyzed": n_valid,
             "joint_angles":      triplet_stats,
-            "torso_angles":      segment_stats,
         }
         yaml_path = OUT_DIR / f"{DATA_NAME}_pose_rules.yaml"
         with open(yaml_path, "w") as f:
             f.write("# Human pose joint-angle rule book\n")
             f.write("# Angles in degrees. Use min_deg/max_deg as safe-range limits.\n")
-            f.write("# torso_twist ~0 deg = no twist; larger = more twisting.\n")
             f.write("# Load in ROS:  import yaml; rules = yaml.safe_load(open(path))\n\n")
             yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
 
-        total = len(triplet_stats) + len(segment_stats)
+        total = len(triplet_stats)
         print(f"  Saved rule book ({total} angles, {n_valid} frames): {yaml_path}")
 
     # ------------------------------------------------------------------

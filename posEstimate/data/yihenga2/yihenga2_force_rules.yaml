@@ -2,7 +2,7 @@
 # Units: Newtons. Cropped to same time window as trajectory.
 
 source: yihenga2
-generated: '2026-03-04 19:23:11'
+generated: '2026-03-04 21:59:21'
 crop:
 - 16
 - 22

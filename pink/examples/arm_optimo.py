@@ -39,7 +39,7 @@ ROOT_JOINT   = None
 DATA_NAME  = "yihenga2"
 
 RUN_MODE = "once"  # "loop" or "once"
-TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+TIME_SCALE = 0.3  # < 1.0 slows replay; 1.0 = original recorded speed
 
 
 
@@ -386,6 +386,7 @@ if __name__ == "__main__":
     # Use a simulation clock (dt accumulation) so the saved joint trajectory matches
     # exactly what the simulator executed, independent of wall-clock jitter.
     sim_time = 0.0
+    sim_time_offset = None   # wall-clock time at first saved record (after warmup)
     solved_joint_records = []
     if RUN_MODE == "once" and WARMUP_SKIP_SEC <= 0:
         # Include the true initial simulator state so saved/plot trajectories
@@ -423,11 +424,11 @@ if __name__ == "__main__":
         viz.display(configuration.q)
 
         if RUN_MODE == "once" and float(t_elapsed) >= float(WARMUP_SKIP_SEC):
+            if sim_time_offset is None:
+                sim_time_offset = sim_time
             solved_joint_records.append(
                 {
-                    # Save the exact replay-time index used to generate the target
-                    # for this displayed simulator step.
-                    "t": float(t_elapsed),
+                    "t": float(sim_time - sim_time_offset),
                     "sample_idx": len(solved_joint_records),
                     "q": configuration.q.copy(),
                 }
