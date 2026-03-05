@@ -1,7 +1,18 @@
-# data
+# data files
 *.csv
 *.jsonl
 *.h5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.bag
+*.db
+
+# media
 *.mp4
 *.avi
 *.mov
@@ -10,4 +21,17 @@
 *.jpg
 *.jpeg
 *.bmp
+
+# data directories
+posEstimate/data/
+data/
+
+# python
 *.pyc
+__pycache__/
+*.egg-info/
+.eggs/
+
+# env
+.env
+*.env

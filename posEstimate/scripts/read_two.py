@@ -45,7 +45,7 @@ RunningMode           = mpipe.tasks.vision.RunningMode
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME = "yihenga2"
+DATA_NAME = "davidA1"
 DATA_DIR  = Path("posEstimate/data") / DATA_NAME   # folder created by read_rosbag.py
 OUT_DIR   = DATA_DIR                               # outputs go into the same folder
 

@@ -23,7 +23,7 @@ from read_onboard import read_wrench_force, remove_spikes, save_force_rule_book
 # ==========================================
 
 # ── Camera bag ───────────────────────────────────────────────────────
-DATA_NAME  = "yihenga2"
+DATA_NAME  = "davidA1"
 BAG_PATH   = Path(f"/home/jdx/Downloads/{DATA_NAME}")
 OUT_BASE   = Path("posEstimate/data")
 
