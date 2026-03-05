@@ -1,57 +1,65 @@
 """
-Extract RGB videos from left and right RealSense cameras stored in a rosbag,
-annotate with human pose (MediaPipe) and gripper tracking (ArUco + depth),
-and save a gripper 6DoF pose CSV and a joint-angle rule book.
+Annotate pre-extracted RealSense camera videos with human pose (MediaPipe)
+and gripper tracking (ArUco + depth), then save a gripper 6DoF CSV and
+a joint-angle rule book.
 
-Outputs:
+Prerequisites:
+    Run read_rosbag.py first to extract the bag to posEstimate/data/<DATA_NAME>/.
+
+Processing pipeline:
+    Pass 1  — ArUco detection on gripper-cam video (sequential, fast).
+    Pass 2  — MediaPipe annotation on both cameras IN PARALLEL (2 processes).
+
+Outputs (in posEstimate/data/<DATA_NAME>/):
     <DATA_NAME>_left.mp4           annotated left camera
     <DATA_NAME>_right.mp4          annotated right camera
     <DATA_NAME>.csv                gripper 6DoF trajectory
     <DATA_NAME>_pose_rules.yaml    patient joint-angle rule book
+    <DATA_NAME>_force_rules.yaml   Fx/Fy/Fz stats from cropped force_raw.npy
 """
-import csv
-import sys
 import bisect
+import contextlib
+import csv
 import datetime
+import multiprocessing as mp
+import sys
 from pathlib import Path
 
 import yaml
 import cv2
 import numpy as np
-import mediapipe as mp
+import mediapipe as mpipe
 from scipy.spatial.transform import Rotation as ScipyRotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rosbag_reader import AnyReader, typestore
-from joint_tracker import PoseTracker
-from human_pose import _draw_pose, _draw_vis_legend
 from denoise import denoise_pose_list
 
 # MediaPipe aliases
-BaseOptions           = mp.tasks.BaseOptions
-PoseLandmarker        = mp.tasks.vision.PoseLandmarker
-PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
-RunningMode           = mp.tasks.vision.RunningMode
+BaseOptions           = mpipe.tasks.BaseOptions
+PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mpipe.tasks.vision.PoseLandmarkerOptions
+RunningMode           = mpipe.tasks.vision.RunningMode
 
 # ==========================================
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME = "aba"
-BAG_PATH  = Path(f"/home/jdx/Downloads/{DATA_NAME}")
-OUT_DIR   = Path("posEstimate/data")
+DATA_NAME = "yihenga2"
+DATA_DIR  = Path("posEstimate/data") / DATA_NAME   # folder created by read_rosbag.py
+OUT_DIR   = DATA_DIR                               # outputs go into the same folder
 
 LEFT_TOPIC        = "/left_camera/camera/camera/color/image_raw"
 RIGHT_TOPIC       = "/right_camera/camera/camera/color/image_raw"
 LEFT_DEPTH_TOPIC  = "/left_camera/camera/camera/aligned_depth_to_color/image_raw"
 RIGHT_DEPTH_TOPIC = "/right_camera/camera/camera/aligned_depth_to_color/image_raw"
 
-GRIPPER_CAM  = "left"   # "left" or "right": which camera provides ArUco 3D tracking
+GRIPPER_CAM  = "left"  # "left" or "right": which camera provides ArUco 3D tracking
 HUMAN_POSE   = True     # Toggle MediaPipe human pose
 
-CROP         = (-42, -33)  # (start, end); negative values = seconds from end of stream
-CROP_UNIT    = "s"      # "s" (seconds) or "frame"
+CROP = (16, 22)  # (start, end); negative values = seconds from end of stream
+# CROP      = None    # None = no extra crop (process everything in the extracted video)
+CROP_UNIT = "s"     # "s" (seconds) or "frame"
 
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL   = 15   # must be odd
@@ -60,26 +68,18 @@ SMOOTH_SIGMA        = 20
 MARKER_SIZE_METERS = 0.0725
 
 # --- Human pose rule book ---
-# Joints monitored: shoulders (11,12), elbows (13,14), wrists (15,16), hips (23,24)
-# NOTE: All angles are computed from 3D bone vectors (dot products), so they are
-# camera-position invariant — the rule holds regardless of where the camera is placed.
 POSE_RULE_JOINTS = [11, 12, 13, 14, 15, 16, 23, 24]
-VIS_THRESHOLD    = 0.3   # skip joint if visibility below this
+VIS_THRESHOLD    = 0.3
 
-# --- Triplet angles: angle at the MIDDLE joint (A, B, C) → angle at B ---
 JOINT_ANGLE_TRIPLETS = {
-    # Elbow flexion (arm chain)
-    "left_elbow":       (11, 13, 15),   # l.shoulder – l.elbow – l.wrist
-    "right_elbow":      (12, 14, 16),   # r.shoulder – r.elbow – r.wrist
-    # Shoulder — arm angle relative to the shoulder line
-    "left_shoulder":    (12, 11, 13),   # r.shoulder – l.shoulder – l.elbow
-    "right_shoulder":   (11, 12, 14),   # l.shoulder – r.shoulder – r.elbow
-    # Arm angle relative to trunk (hip-anchored)
-    "left_arm_torso":   (23, 11, 13),   # l.hip – l.shoulder – l.elbow
-    "right_arm_torso":  (24, 12, 14),   # r.hip – r.shoulder – r.elbow
-    # Torso shape: hip-line bending toward each shoulder
-    "torso_left":       (24, 23, 11),   # r.hip – l.hip – l.shoulder
-    "torso_right":      (23, 24, 12),   # l.hip – r.hip – r.shoulder
+    "left_elbow":       (11, 13, 15),
+    "right_elbow":      (12, 14, 16),
+    "left_shoulder":    (12, 11, 13),
+    "right_shoulder":   (11, 12, 14),
+    "left_arm_torso":   (23, 11, 13),
+    "right_arm_torso":  (24, 12, 14),
+    "torso_left":       (24, 23, 11),
+    "torso_right":      (23, 24, 12),
 }
 
 _TRIPLET_DESCRIPTIONS = {
@@ -93,11 +93,8 @@ _TRIPLET_DESCRIPTIONS = {
     "torso_right":      "left hip – right hip – right shoulder (hip bends to right side)",
 }
 
-# --- Segment angles: angle between two separate bone vectors ---
-# Each entry: ((ja, jb), (jc, jd)) → angle between vector (jb-ja) and (jd-jc)
-# Used for torso twist: ~0° means no twist, larger value = more twist.
 SEGMENT_ANGLE_PAIRS = {
-    "torso_twist": ((11, 12), (23, 24)),  # shoulder axis vs hip axis
+    "torso_twist": ((11, 12), (23, 24)),
 }
 
 _SEGMENT_DESCRIPTIONS = {
@@ -107,123 +104,64 @@ _SEGMENT_DESCRIPTIONS = {
 MODEL_PATH = str(Path(__file__).resolve().parent.parent /
                  "data" / "pose_landmarker_full.task")
 
-# Camera intrinsics (848×480 RealSense stream)
 _FX = 602.6597900390625
 _FY = 602.2169799804688
 _CX = 423.1910400390625
 _CY = 249.92578125
 
 CAMERA_MATRIX = np.array(
-    [[_FX, 0.0, _CX], [0.0, _FY, _CY], [0.0, 0.0, 1.0]],
-    dtype=np.float32,
+    [[_FX, 0.0, _CX], [0.0, _FY, _CY], [0.0, 0.0, 1.0]], dtype=np.float32
 )
 DIST_COEFFS = np.zeros((4, 1), dtype=np.float32)
 
 
 # ==========================================
-# --- GRIPPER GEOMETRY (from realsense_pose.py) ---
+# --- GRIPPER GEOMETRY ---
 # ==========================================
 
 def build_T(t, R):
-    """Build 4×4 homogeneous transform from translation t (3,) and rotation R (3,3)."""
     T = np.eye(4, dtype=np.float64)
     T[0:3, 0:3] = np.asarray(R, dtype=np.float64)
-    t = np.asarray(t, dtype=np.float64).reshape(3, 1)
-    T[0:3, 3:4] = t
+    T[0:3, 3:4] = np.asarray(t, dtype=np.float64).reshape(3, 1)
     return T
 
 
 def deproject_pixel_depth_to_point_m(u, v, depth_m):
-    """Back-project aligned depth pixel to camera-frame 3D point (meters)."""
     x = (float(u) - _CX) * float(depth_m) / _FX
     y = (float(v) - _CY) * float(depth_m) / _FY
-    z = float(depth_m)
-    return np.array([x, y, z], dtype=np.float64)
+    return np.array([x, y, float(depth_m)], dtype=np.float64)
 
 
-R_10 = np.array(
-    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]],
-    dtype=np.float64,
-)
-R_20 = np.array(
-    [[0.7071, 0.0, 0.7071], [0.0, 1.0, 0.0], [-0.7071, 0.0, 0.7071]],
-    dtype=np.float64,
-)
-R_30 = np.array(
-    [[0.0, 0.0, 1.0], [-0.6654, 0.7465, 0.0], [-0.7465, -0.6654, 0.0]],
-    dtype=np.float64,
-)
-R_40 = np.array(
-    [[-0.7071, 0.0, 0.7071], [0.0, 1.0, 0.0], [-0.7071, 0.0, -0.7071]],
-    dtype=np.float64,
-)
-R_50 = np.array(
-    [[0.0, 0.0, 1.0], [0.7465, 0.6654, 0.0], [-0.6654, 0.7465, 0.0]],
-    dtype=np.float64,
-)
+R_10 = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]], dtype=np.float64)
+R_20 = np.array([[0.7071, 0.0, 0.7071], [0.0, 1.0, 0.0], [-0.7071, 0.0, 0.7071]], dtype=np.float64)
+R_30 = np.array([[0.0, 0.0, 1.0], [-0.6654, 0.7465, 0.0], [-0.7465, -0.6654, 0.0]], dtype=np.float64)
+R_40 = np.array([[-0.7071, 0.0, 0.7071], [0.0, 1.0, 0.0], [-0.7071, 0.0, -0.7071]], dtype=np.float64)
+R_50 = np.array([[0.0, 0.0, 1.0], [0.7465, 0.6654, 0.0], [-0.6654, 0.7465, 0.0]], dtype=np.float64)
 
 TAG_TRANSFORMS = {
-    1: build_T(t=[0.3927,  0.0225, -0.2142], R=R_10),
-    2: build_T(t=[0.3641,  0.0225,  0.0993], R=R_20),
-    3: build_T(t=[0.3927, -0.0592, -0.2003], R=R_30),
-    4: build_T(t=[0.1912,  0.0225, -0.4561], R=R_40),
-    5: build_T(t=[0.3927,  0.0928, -0.1703], R=R_50),
+    1: build_T([0.3927,  0.0225, -0.2142], R_10),
+    2: build_T([0.3641,  0.0225,  0.0993], R_20),
+    3: build_T([0.3927, -0.0592, -0.2003], R_30),
+    4: build_T([0.1912,  0.0225, -0.4561], R_40),
+    5: build_T([0.3927,  0.0928, -0.1703], R_50),
 }
 
-_half_size = MARKER_SIZE_METERS / 2.0
+_half = MARKER_SIZE_METERS / 2.0
 marker_3d_edges = np.array(
-    [
-        [-_half_size,  _half_size, 0.0],
-        [ _half_size,  _half_size, 0.0],
-        [ _half_size, -_half_size, 0.0],
-        [-_half_size, -_half_size, 0.0],
-    ],
-    dtype=np.float32,
+    [[-_half,  _half, 0.0], [ _half,  _half, 0.0],
+     [ _half, -_half, 0.0], [-_half, -_half, 0.0]], dtype=np.float32
 )
 
 
 # ==========================================
-# --- HELPERS ---
+# --- MODULE-LEVEL HELPERS ---
 # ==========================================
 
 def _angle_at_joint_deg(A, B, C):
-    """Angle in degrees at joint B, between vectors B→A and B→C."""
     BA = np.asarray(A, dtype=np.float64) - np.asarray(B, dtype=np.float64)
     BC = np.asarray(C, dtype=np.float64) - np.asarray(B, dtype=np.float64)
-    denom = np.linalg.norm(BA) * np.linalg.norm(BC) + 1e-8
-    cos_t = np.dot(BA, BC) / denom
+    cos_t = np.dot(BA, BC) / (np.linalg.norm(BA) * np.linalg.norm(BC) + 1e-8)
     return float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
-
-
-def ros_image_to_cv2(msg):
-    height, width, encoding = msg.height, msg.width, msg.encoding
-    data = msg.data if isinstance(msg.data, bytes) else bytes(msg.data)
-    img = np.frombuffer(data, dtype=np.uint8)
-
-    if encoding in ("bgr8",):
-        img = img.reshape((height, width, 3))
-    elif encoding in ("rgb8",):
-        img = img.reshape((height, width, 3))
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    elif encoding in ("mono8",):
-        img = img.reshape((height, width))
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    elif encoding in ("bgra8",):
-        img = img.reshape((height, width, 4))
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    elif encoding in ("rgba8",):
-        img = img.reshape((height, width, 4))
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-    else:
-        raise ValueError(f"Unsupported encoding: {encoding}")
-    return img
-
-
-def get_stamp(msg, fallback_ns):
-    try:
-        return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-    except Exception:
-        return fallback_ns * 1e-9
 
 
 def fps_from_timestamps(timestamps, fallback=30.0):
@@ -234,47 +172,262 @@ def fps_from_timestamps(timestamps, fallback=30.0):
     return float(1.0 / np.median(dts)) if len(dts) else fallback
 
 
-def save_video(frames, timestamps, out_path, fallback_fps=30.0):
-    if not frames:
-        print(f"  No frames to save for {out_path}")
-        return
-    h, w = frames[0].shape[:2]
-    fps = fps_from_timestamps(timestamps, fallback=fallback_fps)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-    if not writer.isOpened():
-        raise RuntimeError(f"Cannot open video writer: {out_path}")
-    for frame in frames:
-        writer.write(frame)
-    writer.release()
-    print(f"  Saved {len(frames)} frames @ {fps:.2f} fps -> {out_path}")
-
-
-def _apply_crop(frames, timestamps, crop, crop_unit):
-    """Crop frames/timestamps by time window or frame indices."""
+def _crop_frame_range(timestamps, crop, crop_unit):
+    """Return (start_idx, end_idx) slice for the crop window."""
     if crop is None:
-        return frames, timestamps
+        return 0, len(timestamps)
     total = len(timestamps)
     if total == 0:
-        return frames, timestamps
-
+        return 0, 0
     start, end = crop
     t_rel = np.asarray(timestamps, dtype=np.float64) - timestamps[0]
-
     if crop_unit == "s":
-        duration = float(t_rel[-1])
-        start_s = float(start) if float(start) >= 0 else duration + float(start)
-        end_s   = float(end)   if float(end)   >= 0 else duration + float(end)
+        dur     = float(t_rel[-1])
+        start_s = float(start) if float(start) >= 0 else dur + float(start)
+        end_s   = float(end)   if float(end)   >= 0 else dur + float(end)
         sf = int(np.searchsorted(t_rel, max(0.0, start_s), side="left"))
         ef = int(np.searchsorted(t_rel, max(0.0, end_s),   side="left"))
     else:
         sf = int(start) if int(start) >= 0 else total + int(start)
         ef = int(end)   if int(end)   >= 0 else total + int(end)
-
     sf = int(np.clip(sf, 0, total))
     ef = int(np.clip(ef, sf, total))
-    print(f"  Crop: frames [{sf}, {ef}) of {total} total")
-    return frames[sf:ef], timestamps[sf:ef]
+    print(f"  Crop: frames [{sf}, {ef}) of {total}")
+    return sf, ef
+
+
+def _find_depth_idx(depth_ts_arr, query_ts, max_dt=0.05):
+    """Binary-search for nearest depth frame index, or None if beyond max_dt."""
+    if len(depth_ts_arr) == 0:
+        return None
+    i = bisect.bisect_left(depth_ts_arr, query_ts)
+    candidates = [j for j in (i - 1, i) if 0 <= j < len(depth_ts_arr)]
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda j: abs(depth_ts_arr[j] - query_ts))
+    return best if abs(depth_ts_arr[best] - query_ts) <= max_dt else None
+
+
+def _annotate_gcam_frame(out, dets, gp):
+    """Overlay ArUco markers and fused gripper frame axes onto a frame (in-place)."""
+    if not dets:
+        return
+    draw_corners = [d["corners_draw"] for d in dets]
+    draw_ids     = np.array([[d["tag_id"]] for d in dets], dtype=np.int32)
+    cv2.aruco.drawDetectedMarkers(out, draw_corners, draw_ids)
+
+    k_positions = []
+    for det in dets:
+        cv2.drawFrameAxes(out, CAMERA_MATRIX, DIST_COEFFS,
+                          det["rvec"], det["tvec_rgb"], MARKER_SIZE_METERS)
+        cx, cy = det["center"]
+        cv2.circle(out, (cx, cy), 4, (0, 255, 255), -1)
+        if det["depth_m"] > 0:
+            cv2.putText(out,
+                        f"{det['tag_id']}:{det['depth_m']*1000:.0f}mm",
+                        (cx + 6, cy - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        if "T_ik" in det:
+            k_positions.append(det["T_ik"][0:3, 3:4])
+
+    if gp is not None:
+        r_m = np.asarray(gp["position"], dtype=np.float64) / 1000.0
+        rvec_k, _ = cv2.Rodrigues(np.asarray(gp["rotation"], dtype=np.float64))
+        cv2.drawFrameAxes(out, CAMERA_MATRIX, DIST_COEFFS,
+                          rvec_k, r_m.reshape(3, 1), MARKER_SIZE_METERS * 1.5)
+        label = f"Tags: {len(k_positions)}" + (" (smoothed)" if SMOOTH_GRIPPER_POSE else "")
+        cv2.putText(out, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+
+# ==========================================
+# --- PARALLEL WORKER FUNCTIONS (module-level for multiprocessing) ---
+# ==========================================
+
+def _gcam_worker(rgb_path, ts_arr, crop_sf, crop_ef,
+                 per_frame_dets, gripper_poses,
+                 fps, out_path, human_pose, model_path):
+    """
+    Process A (gripper camera): MediaPipe + ArUco annotation → output video.
+    Runs in a separate process.
+    """
+    import cv2
+    import numpy as np
+    import mediapipe as mpipe
+    from joint_tracker import PoseTracker
+    from human_pose import _draw_pose, _draw_vis_legend
+
+    BaseOptions           = mpipe.tasks.BaseOptions
+    PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
+    PoseLandmarkerOptions = mpipe.tasks.vision.PoseLandmarkerOptions
+    RunningMode           = mpipe.tasks.vision.RunningMode
+
+    n_frames   = crop_ef - crop_sf
+    cap        = cv2.VideoCapture(str(rgb_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, crop_sf)
+    writer     = None
+    t0_ms      = None
+    prev_ts    = None
+    tracker    = PoseTracker(alpha=0.35, dead_band=3.0) if human_pose else None
+    written    = 0
+    crop_idx   = 0
+
+    mp_options = None
+    if human_pose:
+        mp_options = PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.VIDEO,
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    lm_ctx = PoseLandmarker.create_from_options(mp_options) if human_pose else contextlib.nullcontext(None)
+
+    with lm_ctx as landmarker:
+        for _ in range(n_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            stamp = float(ts_arr[crop_idx])
+            h_f, w_f = frame.shape[:2]
+            out_frame = frame.copy()
+
+            if landmarker is not None:
+                if t0_ms is None:
+                    t0_ms = int(stamp * 1000)
+                ts_ms  = max(0, int(stamp * 1000) - t0_ms)
+                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect_for_video(mp_img, ts_ms)
+                dt     = (stamp - prev_ts) if prev_ts is not None else 0.0
+                prev_ts = stamp
+                if result.pose_landmarks:
+                    lms = result.pose_landmarks[0]
+                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
+                    vis = np.array([lm.visibility for lm in lms])
+                    tracked = tracker.update(pos, vis, dt)
+                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
+                else:
+                    cv2.putText(out_frame, "No pose", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
+                _draw_vis_legend(out_frame, h_f, w_f)
+
+            dets = per_frame_dets[crop_idx] if crop_idx < len(per_frame_dets) else []
+            gp   = gripper_poses[crop_idx]  if crop_idx < len(gripper_poses)  else None
+            _annotate_gcam_frame(out_frame, dets, gp)
+
+            cv2.putText(out_frame, f"Frame: {crop_sf + crop_idx}", (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            if writer is None:
+                writer = cv2.VideoWriter(
+                    str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w_f, h_f)
+                )
+            writer.write(out_frame)
+            crop_idx += 1
+            written  += 1
+            if written % 200 == 0:
+                print(f"  [gcam]  {written}/{n_frames} frames written")
+
+    cap.release()
+    if writer:
+        writer.release()
+    print(f"  [gcam]  Done: {written} frames → {out_path}")
+
+
+def _other_worker(rgb_path, ts_arr, crop_sf, crop_ef,
+                  fps, out_path, lm_save_path,
+                  human_pose, model_path):
+    """
+    Process B (patient camera): MediaPipe annotation → output video + landmarks.
+    Saves landmarks as (N, 33, 4) float32 array [x, y, z, visibility]; NaN = no detection.
+    Runs in a separate process.
+    """
+    import cv2
+    import numpy as np
+    import mediapipe as mpipe
+    from joint_tracker import PoseTracker
+    from human_pose import _draw_pose, _draw_vis_legend
+
+    BaseOptions           = mpipe.tasks.BaseOptions
+    PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
+    PoseLandmarkerOptions = mpipe.tasks.vision.PoseLandmarkerOptions
+    RunningMode           = mpipe.tasks.vision.RunningMode
+
+    n_frames = crop_ef - crop_sf
+    cap      = cv2.VideoCapture(str(rgb_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, crop_sf)
+    writer   = None
+    t0_ms    = None
+    prev_ts  = None
+    tracker  = PoseTracker(alpha=0.35, dead_band=3.0) if human_pose else None
+    written  = 0
+    crop_idx = 0
+
+    lm_arr = np.full((n_frames, 33, 4), np.nan, dtype=np.float32)
+
+    mp_options = None
+    if human_pose:
+        mp_options = PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.VIDEO,
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    lm_ctx = PoseLandmarker.create_from_options(mp_options) if human_pose else contextlib.nullcontext(None)
+
+    with lm_ctx as landmarker:
+        for _ in range(n_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            stamp = float(ts_arr[crop_idx])
+            h_f, w_f = frame.shape[:2]
+            out_frame = frame.copy()
+
+            if landmarker is not None:
+                if t0_ms is None:
+                    t0_ms = int(stamp * 1000)
+                ts_ms  = max(0, int(stamp * 1000) - t0_ms)
+                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect_for_video(mp_img, ts_ms)
+                dt     = (stamp - prev_ts) if prev_ts is not None else 0.0
+                prev_ts = stamp
+                if result.pose_landmarks:
+                    lms = result.pose_landmarks[0]
+                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
+                    vis = np.array([lm.visibility for lm in lms])
+                    tracked = tracker.update(pos, vis, dt)
+                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
+                    for j, lm in enumerate(lms):
+                        lm_arr[crop_idx, j] = [lm.x, lm.y, lm.z, lm.visibility]
+                else:
+                    cv2.putText(out_frame, "No pose", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
+                _draw_vis_legend(out_frame, h_f, w_f)
+
+            if writer is None:
+                writer = cv2.VideoWriter(
+                    str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w_f, h_f)
+                )
+            writer.write(out_frame)
+            crop_idx += 1
+            written  += 1
+            if written % 200 == 0:
+                print(f"  [other] {written}/{n_frames} frames written")
+
+    cap.release()
+    if writer:
+        writer.release()
+
+    np.save(str(lm_save_path), lm_arr[:crop_idx])   # trim to actual frames written
+    print(f"  [other] Done: {written} frames → {out_path}")
+    print(f"  [other] Landmarks saved → {lm_save_path}")
 
 
 # ==========================================
@@ -284,464 +437,305 @@ def _apply_crop(frames, timestamps, crop, crop_unit):
 class TwoCamProcessor:
     def __init__(self):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
+        if not DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"Data directory not found: {DATA_DIR}\n"
+                "Run read_rosbag.py first to extract the bag."
+            )
         if HUMAN_POSE and not Path(MODEL_PATH).exists():
             raise FileNotFoundError(
                 f"MediaPipe model not found: {MODEL_PATH}\n"
                 "Download pose_landmarker_full.task to posEstimate/data/"
             )
 
+        gcam  = "left"  if GRIPPER_CAM == "left" else "right"
+        other = "right" if GRIPPER_CAM == "left" else "left"
+
+        self._gcam_rgb    = DATA_DIR / f"{gcam}.mp4"
+        self._other_rgb   = DATA_DIR / f"{other}.mp4"
+        self._gcam_ts     = np.load(str(DATA_DIR / f"{gcam}_ts.npy"))
+        self._other_ts    = np.load(str(DATA_DIR / f"{other}_ts.npy"))
+        self._gcam_depth_dir = DATA_DIR / f"{gcam}_depth"
+        self._gcam_depth_ts  = (
+            np.load(str(DATA_DIR / f"{gcam}_depth_ts.npy"))
+            if (DATA_DIR / f"{gcam}_depth_ts.npy").exists() else np.array([])
+        )
+        self._other_cam_name = other
+
+        aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        aruco_params = cv2.aruco.DetectorParameters()
+        self._aruco_det = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+
     # ------------------------------------------------------------------
-    # Top-level orchestrator
+    # Orchestrator
     # ------------------------------------------------------------------
 
     def run(self):
-        # Step 1: read all streams from bag in one pass
-        print("Reading bag...")
-        left_frames, left_ts, right_frames, right_ts, gcam_depth_data, other_depth_data = \
-            self._read_both_cameras()
-        print(f"  Left:  {len(left_frames)} frames")
-        print(f"  Right: {len(right_frames)} frames")
-        print(f"  Gripper-cam depth: {len(gcam_depth_data)} frames")
-        print(f"  Other-cam depth:   {len(other_depth_data)} frames")
+        gcam_ts  = self._gcam_ts
+        other_ts = self._other_ts
 
-        # Step 2: crop both cameras
-        left_frames, left_ts   = _apply_crop(left_frames,  left_ts,  CROP, CROP_UNIT)
-        right_frames, right_ts = _apply_crop(right_frames, right_ts, CROP, CROP_UNIT)
-        print(f"  After crop — Left: {len(left_frames)}, Right: {len(right_frames)}")
+        # Apply crop to both cameras independently
+        sf_gcam,  ef_gcam  = _crop_frame_range(gcam_ts,  CROP, CROP_UNIT)
+        sf_other, ef_other = _crop_frame_range(other_ts, CROP, CROP_UNIT)
+        gcam_ts  = gcam_ts[sf_gcam:ef_gcam]
+        other_ts = other_ts[sf_other:ef_other]
+        print(f"  Gripper cam: {len(gcam_ts)} frames  |  Other cam: {len(other_ts)} frames")
 
-        # Identify gripper cam vs other cam
-        if GRIPPER_CAM == "left":
-            gcam_frames, gcam_ts   = left_frames,  left_ts
-            other_frames, other_ts = right_frames, right_ts
-            other_cam_name = "right"
-        else:
-            gcam_frames, gcam_ts   = right_frames, right_ts
-            other_frames, other_ts = left_frames,  left_ts
-            other_cam_name = "left"
+        fps_gcam  = fps_from_timestamps(gcam_ts)  if len(gcam_ts)  >= 2 else 30.0
+        fps_other = fps_from_timestamps(other_ts) if len(other_ts) >= 2 else 30.0
+        print(f"  FPS — gcam: {fps_gcam:.3f}  other: {fps_other:.3f}")
 
-        # Step 3: human pose annotation on both cameras; other cam also returns landmarks
-        if HUMAN_POSE:
-            print("Running MediaPipe on gripper camera...")
-            gcam_annotated, _             = self._run_human_pose(gcam_frames,  gcam_ts)
-            print("Running MediaPipe on other camera (patient)...")
-            other_annotated, other_lms    = self._run_human_pose(other_frames, other_ts)
-        else:
-            gcam_annotated  = [f.copy() for f in gcam_frames]
-            other_annotated = [f.copy() for f in other_frames]
-            other_lms       = [None] * len(other_frames)
+        # ── Force data: crop by same time window in seconds ───────────
+        force_cropped = self._load_and_crop_force()
 
-        # Step 4: ArUco + depth on GRIPPER_CAM
-        print("Running ArUco detection on gripper camera...")
-        gcam_depth_lookup = self._match_depth(gcam_ts, gcam_depth_data)
-        per_frame_dets    = self._run_aruco(gcam_frames, gcam_depth_lookup)
-        gripper_poses_raw = self._build_gripper_poses(per_frame_dets)
+        # ── Pass 1: ArUco detection (sequential, fast) ────────────────
+        print("Pass 1: ArUco detection on gripper camera...")
+        per_frame_dets_all = self._pass1_aruco(gcam_ts, sf_gcam)
 
-        # Step 5: smooth gripper poses
-        gripper_poses = self._smooth_gripper_poses(gripper_poses_raw)
+        gripper_poses_raw = self._build_gripper_poses(per_frame_dets_all)
+        gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
 
-        # Step 6: overlay ArUco annotations on gripper cam annotated frames
-        self._annotate_gripper_cam_frames(gcam_annotated, per_frame_dets, gripper_poses)
-
-        # Step 7: save videos (left always → _left.mp4, right → _right.mp4)
-        stem = Path(BAG_PATH).name
-        if GRIPPER_CAM == "left":
-            save_video(gcam_annotated,  gcam_ts,  OUT_DIR / f"{stem}_left.mp4")
-            save_video(other_annotated, other_ts, OUT_DIR / f"{stem}_right.mp4")
-        else:
-            save_video(other_annotated, other_ts, OUT_DIR / f"{stem}_left.mp4")
-            save_video(gcam_annotated,  gcam_ts,  OUT_DIR / f"{stem}_right.mp4")
-
-        # Step 8: save gripper CSV
         self._save_csv(gripper_poses, gcam_ts)
 
-        # Step 9: compute and save joint-angle rule book from other (patient) camera
-        if HUMAN_POSE:
-            print("Computing patient joint-angle rule book...")
-            other_depth_lookup = self._match_depth(other_ts, other_depth_data)
-            self._compute_and_save_rule_book(
-                other_lms, other_frames, other_ts, other_depth_lookup, other_cam_name
-            )
+        # ── Pass 2: MediaPipe annotation, two cameras in parallel ─────
+        print("Pass 2: Parallel MediaPipe annotation...")
+        stem = DATA_NAME
+        if GRIPPER_CAM == "left":
+            gcam_out_path  = OUT_DIR / f"{stem}_left.mp4"
+            other_out_path = OUT_DIR / f"{stem}_right.mp4"
+        else:
+            gcam_out_path  = OUT_DIR / f"{stem}_right.mp4"
+            other_out_path = OUT_DIR / f"{stem}_left.mp4"
 
-    # ------------------------------------------------------------------
-    # Reading
-    # ------------------------------------------------------------------
+        lm_tmp_path = OUT_DIR / "_tmp_landmarks.npy"
 
-    def _read_both_cameras(self):
-        gcam_depth_topic  = (LEFT_DEPTH_TOPIC  if GRIPPER_CAM == "left" else RIGHT_DEPTH_TOPIC)
-        other_depth_topic = (RIGHT_DEPTH_TOPIC if GRIPPER_CAM == "left" else LEFT_DEPTH_TOPIC)
-        topics_needed = {LEFT_TOPIC, RIGHT_TOPIC, gcam_depth_topic, other_depth_topic}
+        # Determine other-cam frame dimensions for rule book
+        other_cap = cv2.VideoCapture(str(self._other_rgb))
+        other_hw  = (int(other_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                     int(other_cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        other_cap.release()
 
-        left_frames, left_ts   = [], []
-        right_frames, right_ts = [], []
-        gcam_depth_data  = []
-        other_depth_data = []
-
-        with AnyReader([BAG_PATH], default_typestore=typestore) as reader:
-            conns = {c.topic: c for c in reader.connections
-                     if c.topic in topics_needed}
-            missing = topics_needed - set(conns)
-            if missing:
-                color_missing = missing - {gcam_depth_topic, other_depth_topic}
-                if color_missing:
-                    raise RuntimeError(f"Color topics not found in bag: {color_missing}")
-                for t in missing & {gcam_depth_topic, other_depth_topic}:
-                    print(f"  Warning: depth topic not found in bag: {t}")
-
-            for conn, ts, raw in reader.messages(connections=list(conns.values())):
-                msg = typestore.deserialize_cdr(raw, conn.msgtype)
-                stamp = get_stamp(msg, ts)
-
-                if conn.topic == LEFT_TOPIC:
-                    try:
-                        left_frames.append(ros_image_to_cv2(msg))
-                        left_ts.append(stamp)
-                    except Exception as e:
-                        print(f"  Warning: skipping left frame: {e}")
-
-                elif conn.topic == RIGHT_TOPIC:
-                    try:
-                        right_frames.append(ros_image_to_cv2(msg))
-                        right_ts.append(stamp)
-                    except Exception as e:
-                        print(f"  Warning: skipping right frame: {e}")
-
-                elif conn.topic in (gcam_depth_topic, other_depth_topic):
-                    try:
-                        h = msg.height
-                        w = msg.width
-                        step = msg.step
-                        data = msg.data if isinstance(msg.data, bytes) else bytes(msg.data)
-                        dimg = np.frombuffer(data, dtype=np.uint16)
-                        dimg = dimg.reshape((h, step // 2))[:, :w]
-                        if conn.topic == gcam_depth_topic:
-                            gcam_depth_data.append((stamp, dimg))
-                        else:
-                            other_depth_data.append((stamp, dimg))
-                    except Exception as e:
-                        print(f"  Warning: skipping depth frame: {e}")
-
-        return left_frames, left_ts, right_frames, right_ts, gcam_depth_data, other_depth_data
-
-    # ------------------------------------------------------------------
-    # Depth matching
-    # ------------------------------------------------------------------
-
-    def _match_depth(self, rgb_timestamps, depth_data, max_dt_s=0.05):
-        """
-        Return dict[frame_idx -> depth_img] by nearest-timestamp matching.
-        """
-        if not depth_data:
-            return {}
-        depth_ts = [t for t, _ in depth_data]
-        result = {}
-        for frame_idx, t_rgb in enumerate(rgb_timestamps):
-            t_rgb = float(t_rgb)
-            j = bisect.bisect_left(depth_ts, t_rgb)
-            candidates = []
-            if j > 0:
-                candidates.append(j - 1)
-            if j < len(depth_ts):
-                candidates.append(j)
-            if not candidates:
-                continue
-            best = min(candidates, key=lambda k: abs(depth_ts[k] - t_rgb))
-            if abs(depth_ts[best] - t_rgb) <= max_dt_s:
-                result[frame_idx] = depth_data[best][1]
-        return result
-
-    # ------------------------------------------------------------------
-    # Human pose
-    # ------------------------------------------------------------------
-
-    def _run_human_pose(self, frames, timestamps):
-        """Run MediaPipe PoseLandmarker on frames; return list of annotated BGR images."""
-        if not frames:
-            return []
-
-        options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=RunningMode.VIDEO,
-            min_pose_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+        p_gcam = mp.Process(
+            target=_gcam_worker,
+            args=(
+                str(self._gcam_rgb),
+                gcam_ts, sf_gcam, ef_gcam,
+                per_frame_dets_all, gripper_poses,
+                fps_gcam, str(gcam_out_path),
+                False, MODEL_PATH,
+            ),
         )
-        tracker = PoseTracker(alpha=0.35, dead_band=3.0)
-        t0_ms = int(timestamps[0] * 1000)
-        dts = [0.0] + list(np.diff(np.asarray(timestamps, dtype=np.float64)))
-        h, w = frames[0].shape[:2]
-        annotated   = []
-        all_landmarks = []   # list[list[NormalizedLandmark] | None]
+        p_other = mp.Process(
+            target=_other_worker,
+            args=(
+                str(self._other_rgb),
+                other_ts, sf_other, ef_other,
+                fps_other, str(other_out_path),
+                str(lm_tmp_path),
+                HUMAN_POSE, MODEL_PATH,
+            ),
+        )
 
-        with PoseLandmarker.create_from_options(options) as landmarker:
-            for i, (bgr, ts, dt) in enumerate(zip(frames, timestamps, dts)):
-                rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                ts_ms  = max(0, int(ts * 1000) - t0_ms)
+        p_gcam.start()
+        p_other.start()
+        p_gcam.join()
+        p_other.join()
 
-                result = landmarker.detect_for_video(mp_img, ts_ms)
-                out = bgr.copy()
+        if p_gcam.exitcode != 0:
+            print(f"  WARNING: gcam worker exited with code {p_gcam.exitcode}")
+        if p_other.exitcode != 0:
+            print(f"  WARNING: other worker exited with code {p_other.exitcode}")
 
-                if result.pose_landmarks:
-                    lms = result.pose_landmarks[0]
-                    positions    = np.array([[lm.x * w, lm.y * h, lm.z * w] for lm in lms])
-                    visibilities = np.array([lm.visibility for lm in lms])
-                    tracked = tracker.update(positions, visibilities, dt)
-                    _draw_pose(out, lms, tracked, h, w)
-                    all_landmarks.append(lms)
-                else:
-                    cv2.putText(out, "No pose", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
-                    all_landmarks.append(None)
+        # ── Rule book (from landmarks saved by other worker) ──────────
+        if HUMAN_POSE and lm_tmp_path.exists():
+            print("Computing patient joint-angle rule book...")
+            lm_arr = np.load(str(lm_tmp_path))
+            self._compute_and_save_rule_book(lm_arr, other_hw, self._other_cam_name)
+            lm_tmp_path.unlink(missing_ok=True)
 
-                _draw_vis_legend(out, h, w)
-                annotated.append(out)
-
-                if (i + 1) % 50 == 0:
-                    print(f"    MediaPipe: {i+1}/{len(frames)} frames")
-
-        return annotated, all_landmarks
+        # ── Force rule book ───────────────────────────────────────────
+        if force_cropped is not None and len(force_cropped) > 0:
+            self._save_force_rules(force_cropped)
 
     # ------------------------------------------------------------------
-    # ArUco detection
+    # Pass 1: ArUco detection from video file
     # ------------------------------------------------------------------
 
-    def _run_aruco(self, frames, depth_lookup):
-        """Detect ArUco markers per frame; return per_frame_detections."""
-        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        parameters = cv2.aruco.DetectorParameters()
-        detector   = cv2.aruco.ArucoDetector(dictionary, parameters)
+    def _pass1_aruco(self, gcam_ts, start_frame):
+        """
+        Read gripper-cam video frame-by-frame, detect ArUco per frame.
+        Depth is loaded from 16-bit PNG files when available.
+        Returns per_frame_dets: list[list[dict]] aligned to gcam_ts.
+        """
+        n_frames = len(gcam_ts)
+        depth_ts = self._gcam_depth_ts
+        depth_dir = self._gcam_depth_dir
+        has_depth = depth_dir.exists() and len(depth_ts) > 0
 
+        cap = cv2.VideoCapture(str(self._gcam_rgb))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         per_frame_dets = []
-        for frame_idx, color_image in enumerate(frames):
-            corners, ids, _ = detector.detectMarkers(color_image)
-            frame_dets = []
 
-            if ids is not None:
-                for i in range(len(ids)):
-                    tag_id = int(ids[i][0])
-                    if tag_id not in TAG_TRANSFORMS:
-                        continue
+        for crop_idx in range(n_frames):
+            ret, frame = cap.read()
+            if not ret:
+                per_frame_dets.append([])
+                continue
 
-                    marker_2d = corners[i][0].astype(np.float32)
-                    ok, rvec, tvec_rgb = cv2.solvePnP(
-                        marker_3d_edges, marker_2d, CAMERA_MATRIX, DIST_COEFFS
-                    )
-                    if not ok:
-                        continue
+            depth_img = None
+            if has_depth:
+                di = _find_depth_idx(depth_ts, float(gcam_ts[crop_idx]))
+                if di is not None:
+                    dp = depth_dir / f"{di:06d}.png"
+                    if dp.exists():
+                        depth_img = cv2.imread(str(dp), cv2.IMREAD_ANYDEPTH)
 
-                    R_ij, _ = cv2.Rodrigues(rvec)
-                    cx = int(np.mean(marker_2d[:, 0]))
-                    cy = int(np.mean(marker_2d[:, 1]))
+            dets = self._detect_aruco_frame(frame, depth_img)
+            per_frame_dets.append(dets)
 
-                    depth_m = 0.0
-                    depth_img = depth_lookup.get(frame_idx)
-                    if depth_img is not None:
-                        if 0 <= cy < depth_img.shape[0] and 0 <= cx < depth_img.shape[1]:
-                            raw_mm = depth_img[cy, cx]
-                            if raw_mm > 0:
-                                depth_m = float(raw_mm) / 1000.0
+            if (crop_idx + 1) % 500 == 0:
+                print(f"  Pass 1: {crop_idx + 1}/{n_frames} frames")
 
-                    frame_dets.append({
-                        "tag_id":       tag_id,
-                        "corners_draw": corners[i],
-                        "marker_2d":    marker_2d,
-                        "rvec":         rvec,
-                        "tvec_rgb":     tvec_rgb,
-                        "R_ij":         R_ij,
-                        "center":       (cx, cy),
-                        "depth_m":      depth_m,
-                    })
-
-            per_frame_dets.append(frame_dets)
-
+        cap.release()
         total_dets = sum(len(d) for d in per_frame_dets)
-        print(f"  ArUco: {total_dets} marker detections across {len(frames)} frames")
+        print(f"  ArUco: {total_dets} detections across {n_frames} frames")
         return per_frame_dets
+
+    # ------------------------------------------------------------------
+    # ArUco detection (single frame)
+    # ------------------------------------------------------------------
+
+    def _detect_aruco_frame(self, color_image, depth_img):
+        corners, ids, _ = self._aruco_det.detectMarkers(color_image)
+        frame_dets = []
+        if ids is None:
+            return frame_dets
+
+        for i in range(len(ids)):
+            tag_id = int(ids[i][0])
+            if tag_id not in TAG_TRANSFORMS:
+                continue
+            marker_2d = corners[i][0].astype(np.float32)
+            ok, rvec, tvec_rgb = cv2.solvePnP(
+                marker_3d_edges, marker_2d, CAMERA_MATRIX, DIST_COEFFS
+            )
+            if not ok:
+                continue
+            R_ij, _ = cv2.Rodrigues(rvec)
+            cx = int(np.mean(marker_2d[:, 0]))
+            cy = int(np.mean(marker_2d[:, 1]))
+            depth_m = 0.0
+            if depth_img is not None:
+                if 0 <= cy < depth_img.shape[0] and 0 <= cx < depth_img.shape[1]:
+                    raw_mm = depth_img[cy, cx]
+                    if raw_mm > 0:
+                        depth_m = float(raw_mm) / 1000.0
+            frame_dets.append({
+                "tag_id":       tag_id,
+                "corners_draw": corners[i],
+                "marker_2d":    marker_2d,
+                "rvec":         rvec,
+                "tvec_rgb":     tvec_rgb,
+                "R_ij":         R_ij,
+                "center":       (cx, cy),
+                "depth_m":      depth_m,
+            })
+        return frame_dets
 
     # ------------------------------------------------------------------
     # Gripper pose computation
     # ------------------------------------------------------------------
 
     def _build_gripper_poses(self, per_frame_dets):
-        """Fuse multi-tag detections into gripper CoM pose per frame."""
-        num_frames = len(per_frame_dets)
-        gripper_poses_raw = [None] * num_frames
-
+        n = len(per_frame_dets)
+        poses = [None] * n
         for f_idx, frame_dets in enumerate(per_frame_dets):
-            k_positions = []
-            k_rotations = []
-
+            k_pos, k_rot = [], []
             for det in frame_dets:
-                tag_id    = det["tag_id"]
-                R_ij      = det["R_ij"]
-                depth_m   = det["depth_m"]
-                cx, cy    = det["center"]
-
-                if depth_m > 0:
-                    t_ij = deproject_pixel_depth_to_point_m(cx, cy, depth_m).reshape(3, 1)
+                if det["depth_m"] > 0:
+                    t_ij = deproject_pixel_depth_to_point_m(
+                        det["center"][0], det["center"][1], det["depth_m"]
+                    ).reshape(3, 1)
                 else:
                     t_ij = np.asarray(det["tvec_rgb"], dtype=np.float64).reshape(3, 1)
-
-                T_ij = build_T(t_ij, R_ij)
-                T_ik = T_ij @ TAG_TRANSFORMS[tag_id]
+                T_ij = build_T(t_ij, det["R_ij"])
+                T_ik = T_ij @ TAG_TRANSFORMS[det["tag_id"]]
                 det["T_ik"] = T_ik
-
-                k_positions.append(T_ik[0:3, 3:4])
-                k_rotations.append(T_ik[0:3, 0:3])
-
-            if k_positions:
-                r_avg = np.mean(np.stack(k_positions, axis=0), axis=0)
-                gripper_poses_raw[f_idx] = {
-                    "position":  r_avg[:, 0] * 1000.0,   # meters → mm
-                    "rotation":  k_rotations[0].copy(),
+                k_pos.append(T_ik[0:3, 3:4])
+                k_rot.append(T_ik[0:3, 0:3])
+            if k_pos:
+                r_avg = np.mean(np.stack(k_pos, axis=0), axis=0)
+                poses[f_idx] = {
+                    "position":  r_avg[:, 0] * 1000.0,
+                    "rotation":  k_rot[0].copy(),
                     "frame_idx": f_idx,
                 }
-
-        valid_count = sum(1 for p in gripper_poses_raw if p is not None)
-        print(f"  Gripper poses: {valid_count}/{num_frames} frames with valid pose")
-        return gripper_poses_raw
+        valid = sum(1 for p in poses if p is not None)
+        print(f"  Gripper poses: {valid}/{n} frames with valid pose")
+        return poses
 
     def _smooth_gripper_poses(self, poses_raw):
         if SMOOTH_GRIPPER_POSE:
-            poses = denoise_pose_list(
-                poses_raw,
-                med_kernel=SMOOTH_MED_KERNEL,
-                sigma=SMOOTH_SIGMA,
-            )
-            print(f"  Applied gripper smoothing: med_kernel={SMOOTH_MED_KERNEL}, sigma={SMOOTH_SIGMA}")
+            poses = denoise_pose_list(poses_raw,
+                                      med_kernel=SMOOTH_MED_KERNEL, sigma=SMOOTH_SIGMA)
+            print(f"  Smoothing: med_kernel={SMOOTH_MED_KERNEL}, sigma={SMOOTH_SIGMA}")
         else:
             poses = poses_raw
         return poses
 
     # ------------------------------------------------------------------
-    # Annotation
+    # Rule book
     # ------------------------------------------------------------------
 
-    def _annotate_gripper_cam_frames(self, annotated_frames, per_frame_dets, gripper_poses):
-        """Overlay ArUco markers and gripper frame axes onto already-annotated frames."""
-        for frame_idx, (out, frame_dets) in enumerate(zip(annotated_frames, per_frame_dets)):
-            if not frame_dets:
-                continue
-
-            # Draw detected marker outlines and IDs
-            draw_corners = [d["corners_draw"] for d in frame_dets]
-            draw_ids     = np.array([[d["tag_id"]] for d in frame_dets], dtype=np.int32)
-            cv2.aruco.drawDetectedMarkers(out, draw_corners, draw_ids)
-
-            # Draw per-tag frame axes + center dot + depth label
-            k_positions = []
-            for det in frame_dets:
-                cv2.drawFrameAxes(
-                    out, CAMERA_MATRIX, DIST_COEFFS,
-                    det["rvec"], det["tvec_rgb"], MARKER_SIZE_METERS
-                )
-                cx, cy = det["center"]
-                cv2.circle(out, (cx, cy), 4, (0, 255, 255), -1)
-                if det["depth_m"] > 0:
-                    cv2.putText(
-                        out,
-                        f"{det['tag_id']}:{det['depth_m']*1000:.0f}mm",
-                        (cx + 6, cy - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1,
-                    )
-                if "T_ik" in det:
-                    k_positions.append(det["T_ik"][0:3, 3:4])
-
-            # Draw fused gripper CoM frame
-            gp = gripper_poses[frame_idx] if frame_idx < len(gripper_poses) else None
-            if gp is not None:
-                r_m = np.asarray(gp["position"], dtype=np.float64) / 1000.0
-                rvec_k, _ = cv2.Rodrigues(np.asarray(gp["rotation"], dtype=np.float64))
-                cv2.drawFrameAxes(
-                    out, CAMERA_MATRIX, DIST_COEFFS,
-                    rvec_k, r_m.reshape(3, 1), MARKER_SIZE_METERS * 1.5,
-                )
-                label = (f"Tags: {len(k_positions)}"
-                         + (" (smoothed)" if SMOOTH_GRIPPER_POSE else ""))
-                cv2.putText(out, label, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-            cv2.putText(out, f"Frame: {frame_idx}", (10, 65),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-    # ------------------------------------------------------------------
-    # Patient joint-angle rule book
-    # ------------------------------------------------------------------
-
-    def _compute_and_save_rule_book(self, all_landmarks, frames, timestamps,
-                                    depth_lookup, cam_name):
+    def _compute_and_save_rule_book(self, lm_arr, frame_hw, cam_name):
         """
-        Compute per-frame 3D joint angles (joints 11-16, 23, 24) and aggregate
-        min/max/mean/std into a YAML rule book.
-
-        All angles are derived from 3D bone vectors (dot products), making them
-        camera-position invariant — the same rule holds regardless of camera placement.
-
-        3D position:  aligned depth → deproject;  fallback: MediaPipe lm.z * frame_width
+        lm_arr: (N, 33, 4) float32 — columns [x, y, z, visibility].
+                NaN rows = frames with no MediaPipe detection.
         """
-        if not frames:
+        if lm_arr.ndim != 3 or lm_arr.shape[1:] != (33, 4):
+            print("  Rule book: unexpected landmark array shape, skipping.")
             return
 
-        h, w = frames[0].shape[:2]
+        h, w = frame_hw
         all_joints = set(POSE_RULE_JOINTS)
         for (ja, jb), (jc, jd) in SEGMENT_ANGLE_PAIRS.values():
             all_joints.update([ja, jb, jc, jd])
 
-        triplet_samples: dict[str, list[float]] = {n: [] for n in JOINT_ANGLE_TRIPLETS}
-        segment_samples: dict[str, list[float]] = {n: [] for n in SEGMENT_ANGLE_PAIRS}
+        triplet_samples = {n: [] for n in JOINT_ANGLE_TRIPLETS}
+        segment_samples = {n: [] for n in SEGMENT_ANGLE_PAIRS}
 
-        for frame_idx, lms in enumerate(all_landmarks):
-            if lms is None:
+        for frame_data in lm_arr:
+            if np.all(np.isnan(frame_data)):
                 continue
 
-            depth_img = depth_lookup.get(frame_idx)
-
-            # Build 3D position for every required joint
-            joint_3d: dict[int, np.ndarray | None] = {}
+            joint_3d = {}
             for j in sorted(all_joints):
-                lm = lms[j]
-                if lm.visibility < VIS_THRESHOLD:
+                x, y, z, vis = frame_data[j]
+                if np.isnan(x) or float(vis) < VIS_THRESHOLD:
                     joint_3d[j] = None
                     continue
-                cx = int(np.clip(int(lm.x * w), 0, w - 1))
-                cy = int(np.clip(int(lm.y * h), 0, h - 1))
+                joint_3d[j] = np.array([float(x) * w, float(y) * h, float(z) * w],
+                                        dtype=np.float64)
 
-                depth_m = 0.0
-                if depth_img is not None:
-                    raw_mm = depth_img[cy, cx]
-                    if raw_mm > 0:
-                        depth_m = float(raw_mm) / 1000.0
-
-                if depth_m > 0:
-                    pos = deproject_pixel_depth_to_point_m(cx, cy, depth_m)
-                else:
-                    # MediaPipe z shares the same normalised scale as x
-                    pos = np.array([lm.x * w, lm.y * h, lm.z * w], dtype=np.float64)
-
-                joint_3d[j] = pos
-
-            # Triplet angles (angle at middle joint)
             for name, (ja, jb, jc) in JOINT_ANGLE_TRIPLETS.items():
                 A, B, C = joint_3d.get(ja), joint_3d.get(jb), joint_3d.get(jc)
                 if A is None or B is None or C is None:
                     continue
                 triplet_samples[name].append(_angle_at_joint_deg(A, B, C))
 
-            # Segment angles (angle between two separate bone vectors)
             for name, ((ja, jb), (jc, jd)) in SEGMENT_ANGLE_PAIRS.items():
                 A, B = joint_3d.get(ja), joint_3d.get(jb)
                 C, D = joint_3d.get(jc), joint_3d.get(jd)
                 if A is None or B is None or C is None or D is None:
                     continue
-                seg1 = np.asarray(B, dtype=np.float64) - np.asarray(A, dtype=np.float64)
-                seg2 = np.asarray(D, dtype=np.float64) - np.asarray(C, dtype=np.float64)
-                denom = np.linalg.norm(seg1) * np.linalg.norm(seg2) + 1e-8
-                cos_t = np.dot(seg1, seg2) / denom
+                seg1 = np.asarray(B) - np.asarray(A)
+                seg2 = np.asarray(D) - np.asarray(C)
+                cos_t = np.dot(seg1, seg2) / (np.linalg.norm(seg1) * np.linalg.norm(seg2) + 1e-8)
                 segment_samples[name].append(
                     float(np.degrees(np.arccos(np.clip(cos_t, -1.0, 1.0))))
                 )
 
-        def _stats(name, samples, joints_field, desc_field):
+        def _stats(samples, joints_field, desc_field):
             if not samples:
                 return None
             arr = np.asarray(samples, dtype=np.float64)
@@ -755,20 +749,14 @@ class TwoCamProcessor:
                 "std_deg":     round(float(arr.std()),  2),
             }
 
-        triplet_stats = {}
-        for name, samples in triplet_samples.items():
-            s = _stats(name, samples,
-                       list(JOINT_ANGLE_TRIPLETS[name]),
-                       _TRIPLET_DESCRIPTIONS[name])
-            if s:
-                triplet_stats[name] = s
-
+        triplet_stats = {
+            n: s for n, samps in triplet_samples.items()
+            if (s := _stats(samps, list(JOINT_ANGLE_TRIPLETS[n]), _TRIPLET_DESCRIPTIONS[n]))
+        }
         segment_stats = {}
-        for name, samples in segment_samples.items():
+        for name, samps in segment_samples.items():
             (ja, jb), (jc, jd) = SEGMENT_ANGLE_PAIRS[name]
-            s = _stats(name, samples,
-                       [[ja, jb], [jc, jd]],
-                       _SEGMENT_DESCRIPTIONS[name])
+            s = _stats(samps, [[ja, jb], [jc, jd]], _SEGMENT_DESCRIPTIONS[name])
             if s:
                 segment_stats[name] = s
 
@@ -776,22 +764,20 @@ class TwoCamProcessor:
             print("  Rule book: no valid angle samples found.")
             return
 
-        n_valid = int(sum(1 for lm in all_landmarks if lm is not None))
+        n_valid = int(np.sum(~np.all(np.isnan(lm_arr), axis=(1, 2))))
         doc = {
             "source_bag":        DATA_NAME,
             "patient_camera":    cam_name,
             "generated":         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "invariant_note":    (
                 "Angles are computed from 3D bone vectors (dot products). "
-                "They are camera-rotation invariant — the rule holds regardless "
-                "of camera placement."
+                "Camera-rotation invariant — rule holds regardless of camera placement."
             ),
             "joints_monitored":  POSE_RULE_JOINTS,
             "n_frames_analyzed": n_valid,
-            "joint_angles":      triplet_stats,   # angle at a single joint
-            "torso_angles":      segment_stats,   # angle between two body segments
+            "joint_angles":      triplet_stats,
+            "torso_angles":      segment_stats,
         }
-
         yaml_path = OUT_DIR / f"{DATA_NAME}_pose_rules.yaml"
         with open(yaml_path, "w") as f:
             f.write("# Human pose joint-angle rule book\n")
@@ -804,26 +790,80 @@ class TwoCamProcessor:
         print(f"  Saved rule book ({total} angles, {n_valid} frames): {yaml_path}")
 
     # ------------------------------------------------------------------
+    # Force helpers
+    # ------------------------------------------------------------------
+
+    def _load_and_crop_force(self):
+        """Load force_raw.npy and slice to the same relative time window as CROP.
+
+        force_raw[:, 0] is relative time (zeroed at first force sample).
+        CROP is applied as the same number of seconds from each stream's own start/end.
+        Returns cropped (N, 4) array or None if file missing or CROP_UNIT != "s".
+        """
+        force_path = DATA_DIR / "force_raw.npy"
+        if not force_path.exists():
+            print("  Force: force_raw.npy not found, skipping force rule book.")
+            return None
+        if CROP_UNIT != "s":
+            print("  Force: CROP_UNIT != 's', skipping time-based force crop.")
+            return np.load(str(force_path))
+
+        force_raw = np.load(str(force_path))  # (N, 4): [t_rel, Fx, Fy, Fz]
+        if CROP is None:
+            print(f"  Force: {len(force_raw)} samples (no crop)")
+            return force_raw
+
+        force_t = force_raw[:, 0]
+        dur_f   = float(force_t[-1])
+        t_start = float(CROP[0]) if float(CROP[0]) >= 0 else dur_f + float(CROP[0])
+        t_end   = float(CROP[1]) if float(CROP[1]) >= 0 else dur_f + float(CROP[1])
+        sf_f = int(np.searchsorted(force_t, max(0.0, t_start), side="left"))
+        ef_f = int(np.searchsorted(force_t, max(0.0, t_end),   side="left"))
+        cropped = force_raw[sf_f:ef_f]
+        print(f"  Force: {len(cropped)} samples kept (t={t_start:.2f}s → {t_end:.2f}s)")
+        return cropped
+
+    def _save_force_rules(self, force_data):
+        """Save per-axis Fx/Fy/Fz min/max/mean/std from cropped force data."""
+        axis_stats = {}
+        for col, name in enumerate(("Fx", "Fy", "Fz"), start=1):
+            vals = force_data[:, col]
+            axis_stats[name] = {
+                "n_samples": int(len(vals)),
+                "min_N":     round(float(np.min(vals)),  2),
+                "max_N":     round(float(np.max(vals)),  2),
+                "mean_N":    round(float(np.mean(vals)), 2),
+                "std_N":     round(float(np.std(vals)),  2),
+            }
+        doc = {
+            "source":     DATA_NAME,
+            "generated":  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "crop":       list(CROP) if CROP is not None else None,
+            "n_samples":  int(len(force_data)),
+            "duration_s": round(float(force_data[-1, 0] - force_data[0, 0]), 3),
+            "force_axes": axis_stats,
+        }
+        yaml_path = OUT_DIR / f"{DATA_NAME}_force_rules.yaml"
+        with open(yaml_path, "w") as f:
+            f.write("# Force rule book (Fx, Fy, Fz from /rokubi/wrench)\n")
+            f.write("# Units: Newtons. Cropped to same time window as trajectory.\n\n")
+            yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
+        print(f"  Saved force rule book: {yaml_path}")
+
+    # ------------------------------------------------------------------
     # CSV saving
     # ------------------------------------------------------------------
 
     def _save_csv(self, gripper_poses, timestamps):
-        """
-        Save gripper CoM trajectory relative to the first valid frame.
-
-        Poses are expressed in the initial gripper frame:
-            pos   = R0.T @ (t_cam_t - t_cam_0)   [mm], first row = 0,0,0
-            euler = Euler XYZ of R0.T @ R_cam_t   [rad], first row = 0,0,0
-        """
         valid = [(i, p) for i, p in enumerate(gripper_poses) if p is not None]
         if not valid:
             print("  No valid gripper poses to save.")
             return None
 
-        _, first = valid[0]
+        first_i, first = valid[0]
         R0  = first["rotation"]
         t0  = first["position"]
-        ts0 = float(timestamps[first["frame_idx"]])
+        ts0 = float(timestamps[first_i])
 
         csv_path = OUT_DIR / f"{DATA_NAME}.csv"
         with open(csv_path, "w", newline="") as f:
@@ -831,26 +871,19 @@ class TwoCamProcessor:
             writer.writerow(["t", "frame",
                              "pos_x", "pos_y", "pos_z",
                              "orient_x", "orient_y", "orient_z"])
-            first_valid_idx = valid[0][0]
             for idx, pose in valid:
-                ts    = float(timestamps[pose["frame_idx"]]) - ts0
+                ts    = float(timestamps[idx]) - ts0
                 pos   = R0.T @ (pose["position"] - t0)
-                R_rel = R0.T @ pose["rotation"]
-                euler = ScipyRotation.from_matrix(R_rel).as_euler("xyz")
-
-                if idx == first_valid_idx:
-                    ts    = 0.0
-                    pos   = np.zeros(3, dtype=np.float64)
-                    euler = np.zeros(3, dtype=np.float64)
-
+                euler = ScipyRotation.from_matrix(R0.T @ pose["rotation"]).as_euler("xyz")
+                if idx == first_i:
+                    ts, pos, euler = 0.0, np.zeros(3), np.zeros(3)
                 writer.writerow([
-                    round(ts, 6),
-                    pose["frame_idx"],
+                    round(ts, 6), pose["frame_idx"],
                     round(pos[0], 3), round(pos[1], 3), round(pos[2], 3),
                     round(euler[0], 6), round(euler[1], 6), round(euler[2], 6),
                 ])
 
-        print(f"  Saved gripper 6D motion in initial gripper frame: {csv_path}")
+        print(f"  Saved gripper 6D trajectory: {csv_path}")
         return csv_path
 
 

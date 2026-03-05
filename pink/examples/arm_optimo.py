@@ -36,6 +36,12 @@ EE_NAME      = "link8"
 URDF_PATH    = "/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_description/roboligent_optimo.urdf"
 PACKAGE_DIRS = ["/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_description"]
 ROOT_JOINT   = None
+DATA_NAME  = "yihenga2"
+
+RUN_MODE = "once"  # "loop" or "once"
+TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+
+
 
 # Map recorded gripper-frame data into the simulator EE frame:
 # gripper +y -> EE +x
@@ -52,15 +58,11 @@ R_GRIPPER_TO_EE = np.array([
 #   pos_xyz    – displacement in mm from first valid frame, in initial gripper frame
 #   orient_xyz – Euler XYZ angles (rad) relative to initial gripper orientation
 _DEFAULT_CSV = (
-    "/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data"
-    "/aba.csv"
+    f"/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data/{DATA_NAME}/{DATA_NAME}.csv"
 )
 
-# Run behavior flags (edit in code; no CLI flags needed)
-RUN_MODE = "loop"  # "loop" or "once"
 JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
 PLOT_SAVED_JOINT_TRAJ = True
-TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 WARMUP_SKIP_SEC = 0.3  # in RUN_MODE="once", don't save the first N seconds of replay
 TRJ_HZ = 50.0  # output .trj frequency (frames are dropped/interpolated from solver Hz)
 

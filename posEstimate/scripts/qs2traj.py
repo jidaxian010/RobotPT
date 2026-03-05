@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Easier naming (edit one value)
-DATA_NAME = "pose4"
+DATA_NAME = "yihenga2"
 
 def csv_to_trj(input_csv, output_trj, original_hz=200, target_hz=1000, cutoff_hz=50, filter_order=4):
     """
@@ -124,7 +124,7 @@ def plot_joint_traj(timestamps, joint_data, title="Final Trajectory (.trj source
 
 if __name__ == "__main__":
     # Define paths
-    base_dir = Path(__file__).resolve().parents[1] / "data"
+    base_dir = Path(__file__).resolve().parents[1] / "data" / DATA_NAME
     input_csv = base_dir / f"{DATA_NAME}_solved_qs.csv"
     output_trj = base_dir / f"{DATA_NAME}.trj"
     

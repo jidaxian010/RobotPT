@@ -1,0 +1,27 @@
+# Force rule book
+# Units are Newtons. Use min_N/max_N as per-axis safe-range limits.
+# Load in Python: import yaml; rules = yaml.safe_load(open(path))
+
+source_bag: yihenga2_onboard
+topic: /rokubi/wrench
+generated: '2026-03-04 18:44:58'
+n_samples: 8960
+force_ranges:
+  x:
+    n_samples: 8960
+    min_N: -1.72
+    max_N: 35.22
+    mean_N: 18.96
+    std_N: 6.0
+  y:
+    n_samples: 8960
+    min_N: 72.67
+    max_N: 117.73
+    mean_N: 89.65
+    std_N: 7.31
+  z:
+    n_samples: 8960
+    min_N: -46.76
+    max_N: -10.85
+    mean_N: -22.82
+    std_N: 4.28

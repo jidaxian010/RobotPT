@@ -3,11 +3,11 @@
 # torso_twist ~0 deg = no twist; larger = more twisting.
 # Load in ROS:  import yaml; rules = yaml.safe_load(open(path))
 
-source_bag: aba
-patient_camera: right
-generated: '2026-03-01 17:05:28'
-invariant_note: "Angles are computed from 3D bone vectors (dot products). They are\
-  \ camera-rotation invariant \u2014 the rule holds regardless of camera placement."
+source_bag: yihenga1
+patient_camera: left
+generated: '2026-03-04 16:14:47'
+invariant_note: "Angles are computed from 3D bone vectors (dot products). Camera-rotation\
+  \ invariant \u2014 rule holds regardless of camera placement."
 joints_monitored:
 - 11
 - 12
@@ -17,7 +17,7 @@ joints_monitored:
 - 16
 - 23
 - 24
-n_frames_analyzed: 533
+n_frames_analyzed: 7236
 joint_angles:
   left_elbow:
     joints:
@@ -25,22 +25,22 @@ joint_angles:
     - 13
     - 15
     description: "left shoulder \u2013 left elbow \u2013 left wrist"
-    n_samples: 533
-    min_deg: 141.97
-    max_deg: 164.08
-    mean_deg: 157.48
-    std_deg: 4.0
+    n_samples: 6620
+    min_deg: 39.28
+    max_deg: 179.81
+    mean_deg: 131.15
+    std_deg: 16.68
   right_elbow:
     joints:
     - 12
     - 14
     - 16
     description: "right shoulder \u2013 right elbow \u2013 right wrist"
-    n_samples: 533
-    min_deg: 0.37
-    max_deg: 162.69
-    mean_deg: 102.08
-    std_deg: 36.95
+    n_samples: 6541
+    min_deg: 14.37
+    max_deg: 174.96
+    mean_deg: 133.23
+    std_deg: 27.51
   left_shoulder:
     joints:
     - 12
@@ -48,11 +48,11 @@ joint_angles:
     - 13
     description: "right shoulder \u2013 left shoulder \u2013 left elbow (arm vs shoulder\
       \ line)"
-    n_samples: 533
-    min_deg: 63.04
-    max_deg: 122.42
-    mean_deg: 103.98
-    std_deg: 8.93
+    n_samples: 6936
+    min_deg: 36.44
+    max_deg: 179.33
+    mean_deg: 94.91
+    std_deg: 18.95
   right_shoulder:
     joints:
     - 11
@@ -60,33 +60,33 @@ joint_angles:
     - 14
     description: "left shoulder \u2013 right shoulder \u2013 right elbow (arm vs shoulder\
       \ line)"
-    n_samples: 533
-    min_deg: 0.05
-    max_deg: 162.5
-    mean_deg: 113.58
-    std_deg: 28.3
+    n_samples: 6742
+    min_deg: 42.48
+    max_deg: 179.08
+    mean_deg: 100.21
+    std_deg: 26.71
   left_arm_torso:
     joints:
     - 23
     - 11
     - 13
     description: "left hip \u2013 left shoulder \u2013 left elbow (arm vs trunk)"
-    n_samples: 533
-    min_deg: 13.27
-    max_deg: 20.74
-    mean_deg: 16.08
-    std_deg: 1.58
+    n_samples: 6936
+    min_deg: 11.85
+    max_deg: 129.76
+    mean_deg: 31.28
+    std_deg: 19.92
   right_arm_torso:
     joints:
     - 24
     - 12
     - 14
     description: "right hip \u2013 right shoulder \u2013 right elbow (arm vs trunk)"
-    n_samples: 533
-    min_deg: 0.04
-    max_deg: 160.93
-    mean_deg: 64.79
-    std_deg: 27.71
+    n_samples: 6742
+    min_deg: 9.16
+    max_deg: 142.09
+    mean_deg: 65.12
+    std_deg: 34.84
   torso_left:
     joints:
     - 24
@@ -94,11 +94,11 @@ joint_angles:
     - 11
     description: "right hip \u2013 left hip \u2013 left shoulder (hip bends to left\
       \ side)"
-    n_samples: 533
-    min_deg: 87.37
-    max_deg: 115.59
-    mean_deg: 96.45
-    std_deg: 3.63
+    n_samples: 7236
+    min_deg: 55.96
+    max_deg: 145.95
+    mean_deg: 106.92
+    std_deg: 10.51
   torso_right:
     joints:
     - 23
@@ -106,11 +106,11 @@ joint_angles:
     - 12
     description: "left hip \u2013 right hip \u2013 right shoulder (hip bends to right\
       \ side)"
-    n_samples: 533
-    min_deg: 0.06
-    max_deg: 131.65
-    mean_deg: 93.07
-    std_deg: 17.91
+    n_samples: 7236
+    min_deg: 46.66
+    max_deg: 145.45
+    mean_deg: 91.16
+    std_deg: 11.51
 torso_angles:
   torso_twist:
     joints:
@@ -120,8 +120,8 @@ torso_angles:
       - 24
     description: "angle between shoulder axis (11\u219212) and hip axis (23\u2192\
       24); ~0\xB0 = no twist"
-    n_samples: 533
-    min_deg: 7.44
-    max_deg: 140.39
-    mean_deg: 28.55
-    std_deg: 24.47
+    n_samples: 7236
+    min_deg: 0.15
+    max_deg: 32.8
+    mean_deg: 9.06
+    std_deg: 5.76
