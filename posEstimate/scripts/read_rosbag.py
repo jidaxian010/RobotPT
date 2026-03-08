@@ -23,13 +23,17 @@ from read_onboard import read_wrench_force, remove_spikes, save_force_rule_book
 # ==========================================
 
 # ── Camera bag ───────────────────────────────────────────────────────
-DATA_NAME  = "davidA1"
-BAG_PATH   = Path(f"/home/jdx/Downloads/{DATA_NAME}")
+DATA_NAME  = "P2-B2"
+BAG_PATH   = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 OUT_BASE   = Path("posEstimate/data")
 
 # ── Onboard bag ───────────────────────────────────────────────────────
 ONBOARD_DATA_NAME = "yihenga1_onboard"
-ONBOARD_BAG_PATH  = Path(f"/home/jdx/Downloads/{ONBOARD_DATA_NAME}")
+ONBOARD_BAG_PATH  = Path(f"~/Downloads/{ONBOARD_DATA_NAME}").expanduser()
+
+# ── Onboard processing toggle ────────────────────────────────────────
+#   True = read onboard bag and extract force data; False = skip
+PROCESS_ONBOARD = False
 
 # ── Crop ──────────────────────────────────────────────────────────────
 #   0 = keep full video; N > 0 = discard first N seconds and overwrite
@@ -276,4 +280,7 @@ def crop_saved_videos():
 if __name__ == "__main__":
     extract()           # 1. camera rosbag → videos + depth
     crop_saved_videos() # 2. trim first CROP_VIDEO seconds (no-op if 0)
-    read_onboard()      # 3+4. onboard rosbag → force_raw.npy + force_clean.npy + YAML
+    if PROCESS_ONBOARD:
+        read_onboard()  # 3+4. onboard rosbag → force_raw.npy + force_clean.npy + YAML
+    else:
+        print("Skipping onboard data (PROCESS_ONBOARD = False)")

@@ -45,7 +45,7 @@ RunningMode           = mpipe.tasks.vision.RunningMode
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME = "davidA1"
+DATA_NAME = "P2-A4"
 DATA_DIR  = Path("posEstimate/data") / DATA_NAME   # folder created by read_rosbag.py
 OUT_DIR   = DATA_DIR                               # outputs go into the same folder
 
@@ -54,10 +54,10 @@ RIGHT_TOPIC       = "/right_camera/camera/camera/color/image_raw"
 LEFT_DEPTH_TOPIC  = "/left_camera/camera/camera/aligned_depth_to_color/image_raw"
 RIGHT_DEPTH_TOPIC = "/right_camera/camera/camera/aligned_depth_to_color/image_raw"
 
-GRIPPER_CAM  = "left"  # "left" or "right": which camera provides ArUco 3D tracking
+GRIPPER_CAM  = "right"  # "left" or "right": which camera provides ArUco 3D tracking
 HUMAN_POSE   = True     # Toggle MediaPipe human pose
 
-CROP = (16, 22)  # (start, end); negative values = seconds from end of stream
+CROP = (18, 42)  # (start, end); negative values = seconds from end of stream
 # CROP      = None    # None = no extra crop (process everything in the extracted video)
 CROP_UNIT = "s"     # "s" (seconds) or "frame"
 
