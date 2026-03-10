@@ -29,7 +29,8 @@ import yaml
 import cv2
 import numpy as np
 import mediapipe as mpipe
-from scipy.spatial.transform import Rotation as ScipyRotation
+from scipy.interpolate import CubicSpline
+from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -57,13 +58,13 @@ RIGHT_DEPTH_TOPIC = "/right_camera/camera/camera/aligned_depth_to_color/image_ra
 GRIPPER_CAM  = "right"  # "left" or "right": which camera provides ArUco 3D tracking
 HUMAN_POSE   = True     # Toggle MediaPipe human pose
 
-CROP = (18, 42)  # (start, end); negative values = seconds from end of stream
+CROP = (18, 43)  # (start, end); negative values = seconds from end of stream
 # CROP      = None    # None = no extra crop (process everything in the extracted video)
 CROP_UNIT = "s"     # "s" (seconds) or "frame"
 
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL   = 15   # must be odd
-SMOOTH_SIGMA        = 20
+SMOOTH_SIGMA        = 30
 
 MARKER_SIZE_METERS = 0.0725
 
@@ -411,6 +412,315 @@ def _other_worker(rgb_path, ts_arr, crop_sf, crop_ef,
 
 
 # ==========================================
+# --- TRAJECTORY POST-PROCESSING ---
+# ==========================================
+
+RETURN_THRESH_MM = 30.0   # Z-distance from start to count as "returned"
+MIN_CYCLE_SEC    = 6.0    # minimum cycle duration — ignores brief returns
+
+
+def _ensure_quat_continuity(quats):
+    """Flip quaternions so consecutive ones are on the same hemisphere."""
+    for i in range(1, len(quats)):
+        if np.dot(quats[i], quats[i - 1]) < 0:
+            quats[i] = -quats[i]
+    return quats
+
+
+def _interpolate_full(t, frames, pos, euler, fps):
+    """
+    Interpolate sparse CSV (missing frames due to ArUco occlusion) into a
+    complete trajectory with one row per video frame.
+    Uses cubic spline (C2 smooth) instead of linear interp to avoid
+    velocity discontinuities at gap boundaries.
+    """
+    f_min, f_max = int(frames[0]), int(frames[-1])
+    all_frames = np.arange(f_min, f_max + 1)
+    all_t = all_frames / fps
+
+    # Cubic spline for position — C2 continuous across gaps
+    full_pos = np.zeros((len(all_frames), 3))
+    for ax in range(3):
+        cs = CubicSpline(frames, pos[:, ax], bc_type="clamped")
+        full_pos[:, ax] = cs(all_frames)
+
+    rots = ScipyRotation.from_euler("xyz", euler)
+    quats = rots.as_quat()
+    quats = _ensure_quat_continuity(quats)
+    rots = ScipyRotation.from_quat(quats)
+    slerp = Slerp(frames, rots)
+    full_euler = slerp(all_frames).as_euler("xyz")
+
+    n_filled = len(all_frames) - len(frames)
+    print(f"  Interpolated: {len(frames)} → {len(all_frames)} frames "
+          f"({n_filled} filled)")
+    return all_t, all_frames.astype(float), full_pos, full_euler
+
+
+def _detect_cycles(t, pos, thresh_mm, min_sec):
+    """
+    Find cycle start indices by detecting when the gripper height (Z)
+    returns close to its starting height.
+    """
+    start_z = pos[0, 2]
+    dist = np.abs(pos[:, 2] - start_z)
+    close_mask = dist < thresh_mm
+
+    starts = [0]
+    in_close = False
+    region_best_i = None
+    region_best_d = np.inf
+
+    for i in range(1, len(t)):
+        if close_mask[i]:
+            if not in_close:
+                in_close = True
+                region_best_i = i
+                region_best_d = dist[i]
+            elif dist[i] < region_best_d:
+                region_best_i = i
+                region_best_d = dist[i]
+        else:
+            if in_close:
+                if (t[region_best_i] - t[starts[-1]]) >= min_sec:
+                    starts.append(region_best_i)
+                in_close = False
+                region_best_i = None
+                region_best_d = np.inf
+
+    if in_close and region_best_i is not None:
+        if (t[region_best_i] - t[starts[-1]]) >= min_sec:
+            starts.append(region_best_i)
+
+    return starts
+
+
+def _resample_pos(t_in, pos_in, t_out):
+    out = np.zeros((len(t_out), 3))
+    for ax in range(3):
+        out[:, ax] = np.interp(t_out, t_in, pos_in[:, ax])
+    return out
+
+
+def _resample_orient(t_in, euler_in, t_out):
+    rots = ScipyRotation.from_euler("xyz", euler_in)
+    quats = rots.as_quat()
+    quats = _ensure_quat_continuity(quats)
+    rots = ScipyRotation.from_quat(quats)
+    slerp = Slerp(t_in, rots)
+    return slerp(t_out).as_euler("xyz")
+
+
+def _average_orientations(euler_stack):
+    K, N, _ = euler_stack.shape
+    quat_stack = np.zeros((K, N, 4))
+    for k in range(K):
+        q = ScipyRotation.from_euler("xyz", euler_stack[k]).as_quat()
+        q = _ensure_quat_continuity(q)
+        if k > 0 and np.dot(q[0], quat_stack[0, 0]) < 0:
+            q = -q
+        quat_stack[k] = q
+    mean_q = quat_stack.mean(axis=0)
+    mean_q /= np.linalg.norm(mean_q, axis=1, keepdims=True)
+    return ScipyRotation.from_quat(mean_q).as_euler("xyz")
+
+
+def _write_traj_csv(path, t, frames, pos, euler):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "frame", "pos_x", "pos_y", "pos_z",
+                     "orient_x", "orient_y", "orient_z"])
+        for i in range(len(t)):
+            w.writerow([
+                round(float(t[i]), 6), int(frames[i]),
+                round(float(pos[i, 0]), 3),
+                round(float(pos[i, 1]), 3),
+                round(float(pos[i, 2]), 3),
+                round(float(euler[i, 0]), 6),
+                round(float(euler[i, 1]), 6),
+                round(float(euler[i, 2]), 6),
+            ])
+    print(f"  Saved: {path}")
+
+
+CYCLE_COLORS = [
+    (0, 255, 0),    # green
+    (0, 200, 255),  # orange
+    (255, 100, 0),  # blue
+    (200, 0, 255),  # magenta
+    (255, 255, 0),  # cyan
+]
+FLASH_FRAMES = 15
+
+
+def _annotate_video_cycles(video_path, cycle_start_frames):
+    """
+    Re-read the annotated video, overlay cycle markers, and overwrite it.
+    cycle_start_frames: dict mapping video frame index → cycle number.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"  Cannot open video for cycle annotation: {video_path}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Write to a temp file, then replace original
+    tmp_path = Path(video_path).with_suffix(".tmp.mp4")
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    current_cycle = 0
+    flash_remaining = 0
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx in cycle_start_frames:
+            current_cycle = cycle_start_frames[frame_idx]
+            flash_remaining = FLASH_FRAMES
+
+        if current_cycle > 0:
+            color = CYCLE_COLORS[(current_cycle - 1) % len(CYCLE_COLORS)]
+
+            # Colored bar at top
+            cv2.rectangle(frame, (0, 0), (w, 6), color, -1)
+
+            # Persistent label
+            cv2.putText(frame, f"Cycle {current_cycle}", (w - 140, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # Flash banner
+            if flash_remaining > 0:
+                banner = f"CYCLE {current_cycle} START"
+                ts = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+                tx = (w - ts[0]) // 2
+                ty = h // 2
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (tx - 15, ty - ts[1] - 15),
+                              (tx + ts[0] + 15, ty + 15), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+                cv2.putText(frame, banner, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+                flash_remaining -= 1
+
+        writer.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+
+    # Replace original with annotated version
+    import shutil
+    shutil.move(str(tmp_path), str(video_path))
+    print(f"  Annotated video with cycle markers: {video_path}  ({frame_idx} frames)")
+
+
+def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None):
+    """
+    Read the sparse gripper CSV, interpolate to full, detect cycles,
+    average them, save both full and averaged CSVs, and annotate the video.
+    """
+    # Read sparse CSV
+    rows = []
+    with open(sparse_csv_path, "r") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    t     = np.array([float(r["t"])       for r in rows])
+    frame = np.array([int(float(r["frame"])) for r in rows])
+    pos   = np.array([[float(r["pos_x"]), float(r["pos_y"]),
+                        float(r["pos_z"])]  for r in rows])
+    euler = np.array([[float(r["orient_x"]), float(r["orient_y"]),
+                        float(r["orient_z"])] for r in rows])
+
+    # Interpolate to one row per video frame
+    t_full, frames_full, pos_full, euler_full = _interpolate_full(
+        t, frame, pos, euler, fps)
+
+    # Save full trajectory
+    full_path = Path(out_dir) / f"{data_name}_full.csv"
+    _write_traj_csv(full_path, t_full, frames_full, pos_full, euler_full)
+
+    # Detect cycles
+    starts = _detect_cycles(t_full, pos_full, RETURN_THRESH_MM, MIN_CYCLE_SEC)
+
+    print(f"\n  Detected {len(starts)} cycles "
+          f"(thresh={RETURN_THRESH_MM} mm, min_cycle={MIN_CYCLE_SEC} s)")
+    print(f"  {'Cycle':<8} {'t (s)':<10} {'frame':<8} {'pos_z (mm)':<12}")
+    print(f"  {'-'*40}")
+    for ci, si in enumerate(starts):
+        print(f"    {ci+1:<6} {t_full[si]:<10.2f} {int(frames_full[si]):<8} "
+              f"{pos_full[si, 2]:<12.2f}")
+
+    if len(starts) < 2:
+        print("  Only 1 cycle detected — saving full trajectory as the main CSV")
+        avg_path = Path(out_dir) / f"{data_name}.csv"
+        _write_traj_csv(avg_path, t_full, frames_full, pos_full, euler_full)
+        return
+
+    # Annotate video with cycle markers (even before averaging, so we
+    # can bail early on errors below and still have the annotated video)
+    if video_path is not None and Path(video_path).exists():
+        cycle_frame_map = {}
+        for ci, si in enumerate(starts):
+            cycle_frame_map[int(frames_full[si])] = ci + 1
+        _annotate_video_cycles(video_path, cycle_frame_map)
+
+    # Segment cycles — only keep complete cycles (start-to-start).
+    # The last segment (from last start to end-of-data) is dropped because
+    # it doesn't end at a detected return point.
+    if len(starts) < 2:
+        print("  Only 1 cycle start detected — need at least 2 to form a complete cycle")
+        avg_path = Path(out_dir) / f"{data_name}.csv"
+        _write_traj_csv(avg_path, t_full, frames_full, pos_full, euler_full)
+        return
+
+    segments_pos, segments_euler, segments_dur = [], [], []
+    for i in range(len(starts) - 1):
+        i0 = starts[i]
+        i1 = starts[i + 1]
+        t_seg     = t_full[i0:i1] - t_full[i0]
+        pos_seg   = pos_full[i0:i1].copy()
+        euler_seg = euler_full[i0:i1].copy()
+        pos_seg  -= pos_seg[0]
+        segments_pos.append((t_seg, pos_seg))
+        segments_euler.append((t_seg, euler_seg))
+        segments_dur.append(t_seg[-1])
+
+    n_cycles = len(segments_pos)
+    print(f"  Using {n_cycles} complete cycles (dropped last incomplete segment)")
+    print(f"  Durations: " + ", ".join(f"{d:.2f}s" for d in segments_dur))
+
+    # Resample to common length (shortest duration)
+    min_dur = min(segments_dur)
+    median_len = int(np.median([len(s[0]) for s in segments_pos]))
+    t_common = np.linspace(0, min_dur, median_len)
+
+    pos_stack   = np.zeros((n_cycles, median_len, 3))
+    euler_stack = np.zeros((n_cycles, median_len, 3))
+    for k in range(n_cycles):
+        t_seg, p_seg = segments_pos[k]
+        _, e_seg     = segments_euler[k]
+        pos_stack[k]   = _resample_pos(t_seg, p_seg, t_common)
+        euler_stack[k] = _resample_orient(t_seg, e_seg, t_common)
+
+    # Average
+    pos_mean   = pos_stack.mean(axis=0)
+    euler_mean = _average_orientations(euler_stack)
+
+    # Save averaged trajectory as the main CSV
+    avg_path = Path(out_dir) / f"{data_name}.csv"
+    avg_frames = np.arange(len(t_common), dtype=float)
+    _write_traj_csv(avg_path, t_common, avg_frames, pos_mean, euler_mean)
+    print(f"  End position (mm): {pos_mean[-1].round(2)}")
+    print(f"  Averaged {n_cycles} cycles → {avg_path}")
+
+
+# ==========================================
 # --- MAIN PROCESSOR ---
 # ==========================================
 
@@ -475,7 +785,7 @@ class TwoCamProcessor:
         gripper_poses_raw = self._build_gripper_poses(per_frame_dets_all)
         gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
 
-        self._save_csv(gripper_poses, gcam_ts)
+        sparse_csv = self._save_csv(gripper_poses, gcam_ts)
 
         # ── Pass 2: MediaPipe annotation, two cameras in parallel ─────
         print("Pass 2: Parallel MediaPipe annotation...")
@@ -536,6 +846,11 @@ class TwoCamProcessor:
         # ── Force rule book ───────────────────────────────────────────
         if force_cropped is not None and len(force_cropped) > 0:
             self._save_force_rules(force_cropped)
+
+        # ── Interpolate + cycle-average trajectory + annotate video ───
+        if sparse_csv is not None:
+            average_trajectory(sparse_csv, fps_gcam, str(OUT_DIR),
+                               DATA_NAME, str(gcam_out_path))
 
     # ------------------------------------------------------------------
     # Pass 1: ArUco detection from video file
@@ -822,7 +1137,7 @@ class TwoCamProcessor:
         t0  = first["position"]
         ts0 = float(timestamps[first_i])
 
-        csv_path = OUT_DIR / f"{DATA_NAME}.csv"
+        csv_path = OUT_DIR / f"{DATA_NAME}_sparse.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["t", "frame",
@@ -840,7 +1155,7 @@ class TwoCamProcessor:
                     round(euler[0], 6), round(euler[1], 6), round(euler[2], 6),
                 ])
 
-        print(f"  Saved gripper 6D trajectory: {csv_path}")
+        print(f"  Saved sparse gripper trajectory: {csv_path}")
         return csv_path
 
 

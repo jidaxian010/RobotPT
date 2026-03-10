@@ -23,7 +23,7 @@ from read_onboard import read_wrench_force, remove_spikes, save_force_rule_book
 # ==========================================
 
 # ── Camera bag ───────────────────────────────────────────────────────
-DATA_NAME  = "P2-B2"
+DATA_NAME  = "P2-A4"
 BAG_PATH   = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 OUT_BASE   = Path("posEstimate/data")
 

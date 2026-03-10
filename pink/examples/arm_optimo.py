@@ -13,7 +13,12 @@ from pathlib import Path
 import numpy as np
 import qpsolvers
 from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
+from scipy.interpolate import CubicSpline
 import matplotlib.pyplot as plt
+
+import sys
+sys.path = [p for p in sys.path if '/python3.10/' not in p] + \
+           [p for p in sys.path if '/python3.10/' in p]
 
 import meshcat_shapes
 import pink
@@ -33,13 +38,16 @@ except ModuleNotFoundError as exc:
 
 
 EE_NAME      = "link8"
-URDF_PATH    = "/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_description/roboligent_optimo.urdf"
-PACKAGE_DIRS = ["/home/jdx/Documents/1.0LatentAct/pink/data/roboligent_optimo_description"]
+_DATA_DIR    = Path(__file__).resolve().parent.parent / "data" / "roboligent_optimo_description"
+URDF_PATH    = str(_DATA_DIR / "roboligent_optimo.urdf")
+PACKAGE_DIRS = [str(_DATA_DIR)]
 ROOT_JOINT   = None
-DATA_NAME  = "yihenga2"
+DATA_NAME  = "P2-A4"  # for default CSV path; edit one value here
 
-RUN_MODE = "once"  # "loop" or "once"
-TIME_SCALE = 0.3  # < 1.0 slows replay; 1.0 = original recorded speed
+RUN_MODE = "loop"  # "loop" or "once"
+TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+SOLVER_HZ = 200.0  # IK solver frequency (higher = smoother tracking)
+REPARAMETRIZE = True  # arc-length reparametrization for uniform speed
 
 
 
@@ -57,9 +65,8 @@ R_GRIPPER_TO_EE = np.array([
 # Columns: t, frame, pos_x, pos_y, pos_z, orient_x, orient_y, orient_z
 #   pos_xyz    – displacement in mm from first valid frame, in initial gripper frame
 #   orient_xyz – Euler XYZ angles (rad) relative to initial gripper orientation
-_DEFAULT_CSV = (
-    f"/home/jdx/Documents/1.0LatentAct/RobotPT/posEstimate/data/{DATA_NAME}/{DATA_NAME}.csv"
-)
+_REPO_ROOT   = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_CSV = str(_REPO_ROOT / "posEstimate" / "data" / DATA_NAME / f"{DATA_NAME}.csv")
 
 JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
 PLOT_SAVED_JOINT_TRAJ = True
@@ -352,7 +359,7 @@ if __name__ == "__main__":
     tasks.append(damping_task)
     viz.display(configuration.q)
 
-    rate = RateLimiter(frequency=60.0, warn=False)
+    rate = RateLimiter(frequency=SOLVER_HZ, warn=False)
     dt   = rate.period
 
     # Load trajectory
@@ -361,14 +368,40 @@ if __name__ == "__main__":
     if not ee_poses:
         raise RuntimeError(f"No poses loaded — check path: {PATH_TO_POSES}")
 
-    # Pre-build interpolators
+    # Pre-build interpolators — cubic spline for C2-continuous position
     traj_t   = np.array([p["t"] for p in ee_poses])
     traj_pos = np.array([p["position"] for p in ee_poses])   # (N, 3) m
     traj_rot = ScipyRotation.from_matrix(
         np.stack([p["rotation"] for p in ee_poses])
     )
-    slerp   = Slerp(traj_t, traj_rot)
-    T_total = traj_t[-1]
+    pos_spline = CubicSpline(traj_t, traj_pos, bc_type="clamped")
+    slerp      = Slerp(traj_t, traj_rot)
+    T_total    = traj_t[-1]
+
+    # Arc-length reparameterization: resample so the EE moves at constant speed
+    # along the same geometric path. This eliminates sudden fast/slow sections.
+    if REPARAMETRIZE:
+        n_resample = max(len(traj_t) * 4, 2000)
+        t_dense = np.linspace(traj_t[0], traj_t[-1], n_resample)
+        pos_dense = pos_spline(t_dense)
+        ds = np.linalg.norm(np.diff(pos_dense, axis=0), axis=1)
+        arc = np.zeros(n_resample)
+        arc[1:] = np.cumsum(ds)
+        total_arc = arc[-1]
+        # Map: uniform arc-length → original time
+        arc_uniform = np.linspace(0, total_arc, n_resample)
+        t_reparam = np.interp(arc_uniform, arc, t_dense)
+        # Rebuild position and rotation on the new time grid
+        traj_pos_rp = pos_spline(t_reparam)
+        traj_rot_rp = slerp(np.clip(t_reparam, traj_t[0], traj_t[-1]))
+        # Replace interpolators with reparameterized ones
+        traj_t_rp = np.linspace(0, T_total, n_resample)
+        pos_spline = CubicSpline(traj_t_rp, traj_pos_rp, bc_type="clamped")
+        slerp      = Slerp(traj_t_rp, traj_rot_rp)
+        # Verify
+        speeds_rp = np.linalg.norm(np.diff(traj_pos_rp, axis=0), axis=1) / np.diff(traj_t_rp)
+        print(f"  Reparameterized: speed min={speeds_rp.min():.1f} max={speeds_rp.max():.1f} "
+              f"mean={speeds_rp.mean():.1f} mm/s  (path={total_arc*1000:.1f} mm)")
 
     # Anchor trajectory to the robot's current EE pose.
     # CSV starts at (0,0,0) / identity, so relative motion is applied directly
@@ -377,6 +410,7 @@ if __name__ == "__main__":
     initial_position  = initial_transform.translation.copy()
     initial_rotation  = initial_transform.rotation.copy()
     print(f"Initial EE position: {initial_position.round(3)}")
+    print(f"Solver: {SOLVER_HZ} Hz  |  Reparametrize: {REPARAMETRIZE}")
     # Frame-axis offset: maps CSV gripper frame → robot EE frame.
     # CSV frame: y=up, z=out-of-surface (forward).
     # EE frame (with current q_ref): y=up, z=forward → frames are aligned.
@@ -407,9 +441,9 @@ if __name__ == "__main__":
         else:
             t_elapsed = replay_time % T_total
 
-        pos = np.array([np.interp(t_elapsed, traj_t, traj_pos[:, i])
-                        for i in range(3)])
-        rot = slerp(t_elapsed).as_matrix()
+        pos = pos_spline(t_elapsed)
+        rot = slerp(np.clip(t_elapsed, traj_t[0] if not REPARAMETRIZE else 0.0,
+                            traj_t[-1] if not REPARAMETRIZE else T_total)).as_matrix()
 
         target = end_effector_task.transform_target_to_world
         # Apply the recorded displacement in the EE's initial frame, so the
