@@ -37,15 +37,17 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
+DATA_NAME  = "P3-B2"  # for default CSV path; edit one value here
+MOTION   = "b"     # "a" or "b": initial arm configuration
+RUN_MODE = "once"  # "loop" or "once"
+TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+
+
 EE_NAME      = "link8"
 _DATA_DIR    = Path(__file__).resolve().parent.parent / "data" / "roboligent_optimo_description"
 URDF_PATH    = str(_DATA_DIR / "roboligent_optimo.urdf")
 PACKAGE_DIRS = [str(_DATA_DIR)]
 ROOT_JOINT   = None
-DATA_NAME  = "P2-A4"  # for default CSV path; edit one value here
-
-RUN_MODE = "loop"  # "loop" or "once"
-TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 SOLVER_HZ = 200.0  # IK solver frequency (higher = smoother tracking)
 REPARAMETRIZE = True  # arc-length reparametrization for uniform speed
 
@@ -282,38 +284,20 @@ if __name__ == "__main__":
     posture_task = PostureTask(cost=1e-3)
     damping_task = DampingTask(cost=1e-3)
 
-    # q_ref = custom_configuration_vector(
-    #     robot,
-    #     joint1=0.0,
-    #     joint2=2.85,
-    #     joint3=0.0,
-    #     joint4=-1.25,
-    #     joint5=0.0,
-    #     joint6=-1.66,
-    #     joint7=0.0,
-    # )
 
-    # q_ref = custom_configuration_vector(
-    #     robot,
-    #     joint1=0.0,
-    #     joint2=2.85,
-    #     joint3=0.0,
-    #     joint4=-1.58,
-    #     joint5=0.0,
-    #     joint6=-1.43,
-    #     joint7=0.0,
-    # )
-
-    q_ref = custom_configuration_vector( #aba
-        robot,
-        joint1=0.0,
-        joint2=2.69,
-        joint3=0.0,
-        joint4=-1.87,
-        joint5=0.0,
-        joint6=0.69,
-        joint7=0.0,
-    )
+    if MOTION == "a":
+        q_ref = custom_configuration_vector(
+            robot,
+            joint1=0.0, joint2=2.69, joint3=0.0, joint4=-1.87,
+            joint5=0.0, joint6=0.69, joint7=0.0,
+        )
+    else:  # "b"
+        q_ref = custom_configuration_vector(
+            robot,
+            joint1=0.0, joint2=2.57, joint3=0.0, joint4=-1.62,
+            joint5=0.0, joint6=-0.38, joint7=0.0,
+        )
+    
     
     solver = qpsolvers.available_solvers[0]
     if "daqp" in qpsolvers.available_solvers:

@@ -1,9 +1,8 @@
 """
-Data extraction pipeline — runs all steps every time:
+Data extraction pipeline:
 
     1. Read camera rosbag → save videos + depth to disk
     2. Crop saved videos/depth by CROP_VIDEO seconds  (0 = skip)
-    3. Read onboard rosbag → save raw + clean wrench arrays + YAML rule book
 """
 import sys
 from pathlib import Path
@@ -16,24 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rosbag_reader import AnyReader, typestore
-from read_onboard import read_wrench_force, remove_spikes, save_force_rule_book
 
 # ==========================================
 # --- USER CONFIGURATION ---
 # ==========================================
 
-# ── Camera bag ───────────────────────────────────────────────────────
-DATA_NAME  = "P2-A4"
+DATA_NAME  = "P3-B2"
 BAG_PATH   = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 OUT_BASE   = Path("posEstimate/data")
-
-# ── Onboard bag ───────────────────────────────────────────────────────
-ONBOARD_DATA_NAME = "yihenga1_onboard"
-ONBOARD_BAG_PATH  = Path(f"~/Downloads/{ONBOARD_DATA_NAME}").expanduser()
-
-# ── Onboard processing toggle ────────────────────────────────────────
-#   True = read onboard bag and extract force data; False = skip
-PROCESS_ONBOARD = False
 
 # ── Crop ──────────────────────────────────────────────────────────────
 #   0 = keep full video; N > 0 = discard first N seconds and overwrite
@@ -196,24 +185,6 @@ def extract():
         print(f"  Right depth: {depth_idx[RIGHT_DEPTH_TOPIC]} frames → {out_dir / 'right_depth/'}")
 
 
-# ==========================================
-# --- ONBOARD FORCE SENSOR ---
-# ==========================================
-
-def read_onboard():
-    """Read onboard bag, save raw + clean wrench arrays and YAML rule book."""
-    out_dir = OUT_BASE / DATA_NAME
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Reading onboard bag: {ONBOARD_BAG_PATH}")
-    raw_data   = read_wrench_force(ONBOARD_BAG_PATH)
-    clean_data = remove_spikes(raw_data)
-    print(f"  {len(raw_data)} samples  |  duration: {raw_data[-1, 0]:.1f} s")
-    np.save(str(out_dir / "force_raw.npy"),   raw_data)
-    np.save(str(out_dir / "force_clean.npy"), clean_data)
-    print(f"  Saved force_raw.npy / force_clean.npy → {out_dir}")
-    save_force_rule_book(clean_data, ONBOARD_BAG_PATH)
-
-
 def crop_saved_videos():
     """Trim the first CROP_VIDEO seconds from saved mp4s and timestamp arrays (overwrite)."""
     if CROP_VIDEO <= 0:
@@ -280,7 +251,3 @@ def crop_saved_videos():
 if __name__ == "__main__":
     extract()           # 1. camera rosbag → videos + depth
     crop_saved_videos() # 2. trim first CROP_VIDEO seconds (no-op if 0)
-    if PROCESS_ONBOARD:
-        read_onboard()  # 3+4. onboard rosbag → force_raw.npy + force_clean.npy + YAML
-    else:
-        print("Skipping onboard data (PROCESS_ONBOARD = False)")

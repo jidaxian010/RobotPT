@@ -1,27 +1,30 @@
 """
-Annotate pre-extracted RealSense camera videos with human pose (MediaPipe)
-and gripper tracking (ArUco + depth), then save a gripper 6DoF CSV and
-a joint-angle rule book.
+Process a ROS bag directly — no pre-extraction step required.
 
-Prerequisites:
-    Run read_rosbag.py first to extract the bag to posEstimate/data/<DATA_NAME>/.
+Does the same work as read_two.py (ArUco gripper tracking, MediaPipe human
+pose, trajectory CSV, rule books) but reads RGB + depth frames straight from
+the bag file instead of pre-extracted mp4 / npy / PNG files.
 
-Processing pipeline:
-    Pass 1  — ArUco detection on gripper-cam video (sequential, fast).
-    Pass 2  — MediaPipe annotation on both cameras IN PARALLEL (2 processes).
+Two-pass streaming — frames are never buffered in memory:
+    Pass 1 — Stream bag: ArUco detection on gripper camera.
+             Keeps only per-frame detection dicts + timestamps.
+    Pass 2 — Stream bag again: MediaPipe annotation on both cameras,
+             overlay ArUco/gripper results, write annotated video frame-by-frame.
+    Post   — Trajectory CSV, rule books, cycle averaging.
 
 Outputs (in posEstimate/data/<DATA_NAME>/):
     <DATA_NAME>_left.mp4           annotated left camera
     <DATA_NAME>_right.mp4          annotated right camera
-    <DATA_NAME>.csv                gripper 6DoF trajectory
+    <DATA_NAME>_sparse.csv         sparse gripper 6DoF trajectory
+    <DATA_NAME>_full.csv           interpolated full trajectory
+    <DATA_NAME>.csv                cycle-averaged trajectory (or full if <2 cycles)
     <DATA_NAME>_pose_rules.yaml    patient joint-angle rule book
-    <DATA_NAME>_force_rules.yaml   Fx/Fy/Fz stats from cropped force_raw.npy
+    <DATA_NAME>_force_rules.yaml   Fx/Fy/Fz stats from force topic
 """
 import bisect
 import contextlib
 import csv
 import datetime
-import multiprocessing as mp
 import sys
 from pathlib import Path
 
@@ -33,8 +36,12 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from rosbag_reader import AnyReader, typestore
 from denoise import denoise_pose_list
+from joint_tracker import PoseTracker
+from human_pose import _draw_pose, _draw_vis_legend
 
 # MediaPipe aliases
 BaseOptions           = mpipe.tasks.BaseOptions
@@ -46,30 +53,30 @@ RunningMode           = mpipe.tasks.vision.RunningMode
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME   = "P3-B2"
-GRIPPER_CAM = "right"       # "left" or "right": which camera provides ArUco 3D tracking
-CROP        = (11, 21)       # (start, end); negative values = seconds from end of stream
-# CROP      = None          # None = no extra crop (process everything in the extracted video)
-CROP_UNIT   = "s"           # "s" (seconds) or "frame"
+DATA_NAME = "P2-A4"
+BAG_PATH  = Path(f"~/Downloads/{DATA_NAME}").expanduser()
+OUT_DIR   = Path("posEstimate/data") / DATA_NAME
 
-HUMAN_POSE  = True          # Toggle MediaPipe human pose
-
-GRIPPER_PROCESS = "pick"    # "pick" = single pass (no cycle detection)
-                            # "cycle" = detect cycles and average them
-IF_MIRROR       = False      # Only used when GRIPPER_PROCESS="pick":
-                            # append a time-reversed (mirrored) copy of the trajectory
-
-DATA_DIR  = Path("posEstimate/data") / DATA_NAME   # folder created by read_rosbag.py
-OUT_DIR   = DATA_DIR                               # outputs go into the same folder
+# ── Onboard bag (force sensor) ──────────────────────────────────────
+ONBOARD_BAG_PATH  = Path("~/Downloads/yihenga1_onboard").expanduser()
+PROCESS_ONBOARD   = False
+FORCE_TOPIC       = "/rokubi/wrench"
 
 LEFT_TOPIC        = "/left_camera/camera/camera/color/image_raw"
 RIGHT_TOPIC       = "/right_camera/camera/camera/color/image_raw"
 LEFT_DEPTH_TOPIC  = "/left_camera/camera/camera/aligned_depth_to_color/image_raw"
 RIGHT_DEPTH_TOPIC = "/right_camera/camera/camera/aligned_depth_to_color/image_raw"
 
+GRIPPER_CAM  = "right"  # "left" or "right": which camera provides ArUco 3D tracking
+HUMAN_POSE   = True     # Toggle MediaPipe human pose
+
+CROP = (16, 56)  # (start, end); negative values = seconds from end of stream
+# CROP      = None    # None = no extra crop
+CROP_UNIT = "s"     # "s" (seconds) or "frame"
+
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL   = 15   # must be odd
-SMOOTH_SIGMA        = 20
+SMOOTH_SIGMA        = 10
 
 MARKER_SIZE_METERS = 0.0725
 
@@ -142,6 +149,40 @@ marker_3d_edges = np.array(
 # ==========================================
 # --- MODULE-LEVEL HELPERS ---
 # ==========================================
+
+def _ros_image_to_bgr(msg):
+    h, w = msg.height, msg.width
+    data = msg.data if isinstance(msg.data, bytes) else bytes(msg.data)
+    img  = np.frombuffer(data, dtype=np.uint8)
+    enc  = msg.encoding
+    if enc == "bgr8":
+        return img.reshape((h, w, 3))
+    elif enc == "rgb8":
+        return cv2.cvtColor(img.reshape((h, w, 3)), cv2.COLOR_RGB2BGR)
+    elif enc == "mono8":
+        return cv2.cvtColor(img.reshape((h, w)), cv2.COLOR_GRAY2BGR)
+    elif enc == "bgra8":
+        return cv2.cvtColor(img.reshape((h, w, 4)), cv2.COLOR_BGRA2BGR)
+    elif enc == "rgba8":
+        return cv2.cvtColor(img.reshape((h, w, 4)), cv2.COLOR_RGBA2BGR)
+    else:
+        raise ValueError(f"Unsupported encoding: {enc}")
+
+
+def _ros_depth_to_array(msg):
+    h, w = msg.height, msg.width
+    data = msg.data if isinstance(msg.data, bytes) else bytes(msg.data)
+    dimg = np.frombuffer(data, dtype=np.uint16)
+    dimg = dimg.reshape((h, msg.step // 2))[:, :w]
+    return dimg
+
+
+def _get_stamp(msg, fallback_ns):
+    try:
+        return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+    except Exception:
+        return fallback_ns * 1e-9
+
 
 def _angle_at_joint_deg(A, B, C):
     BA = np.asarray(A, dtype=np.float64) - np.asarray(B, dtype=np.float64)
@@ -226,206 +267,14 @@ def _annotate_gcam_frame(out, dets, gp):
 
 
 # ==========================================
-# --- PARALLEL WORKER FUNCTIONS (module-level for multiprocessing) ---
-# ==========================================
-
-def _gcam_worker(rgb_path, ts_arr, crop_sf, crop_ef,
-                 per_frame_dets, gripper_poses,
-                 fps, out_path, human_pose, model_path):
-    """
-    Process A (gripper camera): MediaPipe + ArUco annotation → output video.
-    Runs in a separate process.
-    """
-    import cv2
-    import numpy as np
-    import mediapipe as mpipe
-    from joint_tracker import PoseTracker
-    from human_pose import _draw_pose, _draw_vis_legend
-
-    BaseOptions           = mpipe.tasks.BaseOptions
-    PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
-    PoseLandmarkerOptions = mpipe.tasks.vision.PoseLandmarkerOptions
-    RunningMode           = mpipe.tasks.vision.RunningMode
-
-    n_frames   = crop_ef - crop_sf
-    cap        = cv2.VideoCapture(str(rgb_path))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, crop_sf)
-    writer     = None
-    t0_ms      = None
-    prev_ts    = None
-    tracker    = PoseTracker(alpha=0.35, dead_band=3.0) if human_pose else None
-    written    = 0
-    crop_idx   = 0
-
-    mp_options = None
-    if human_pose:
-        mp_options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=RunningMode.VIDEO,
-            min_pose_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-
-    lm_ctx = PoseLandmarker.create_from_options(mp_options) if human_pose else contextlib.nullcontext(None)
-
-    with lm_ctx as landmarker:
-        for _ in range(n_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            stamp = float(ts_arr[crop_idx])
-            h_f, w_f = frame.shape[:2]
-            out_frame = frame.copy()
-
-            if landmarker is not None:
-                if t0_ms is None:
-                    t0_ms = int(stamp * 1000)
-                ts_ms  = max(0, int(stamp * 1000) - t0_ms)
-                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
-                result = landmarker.detect_for_video(mp_img, ts_ms)
-                dt     = (stamp - prev_ts) if prev_ts is not None else 0.0
-                prev_ts = stamp
-                if result.pose_landmarks:
-                    lms = result.pose_landmarks[0]
-                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
-                    vis = np.array([lm.visibility for lm in lms])
-                    tracked = tracker.update(pos, vis, dt)
-                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
-                else:
-                    cv2.putText(out_frame, "No pose", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
-                _draw_vis_legend(out_frame, h_f, w_f)
-
-            dets = per_frame_dets[crop_idx] if crop_idx < len(per_frame_dets) else []
-            gp   = gripper_poses[crop_idx]  if crop_idx < len(gripper_poses)  else None
-            _annotate_gcam_frame(out_frame, dets, gp)
-
-            cv2.putText(out_frame, f"Frame: {crop_sf + crop_idx}", (10, 65),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-            if writer is None:
-                writer = cv2.VideoWriter(
-                    str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w_f, h_f)
-                )
-            writer.write(out_frame)
-            crop_idx += 1
-            written  += 1
-            if written % 200 == 0:
-                print(f"  [gcam]  {written}/{n_frames} frames written")
-
-    cap.release()
-    if writer:
-        writer.release()
-    print(f"  [gcam]  Done: {written} frames → {out_path}")
-
-
-def _other_worker(rgb_path, ts_arr, crop_sf, crop_ef,
-                  fps, out_path, lm_save_path,
-                  human_pose, model_path):
-    """
-    Process B (patient camera): MediaPipe annotation → output video + landmarks.
-    Saves landmarks as (N, 33, 4) float32 array [x, y, z, visibility]; NaN = no detection.
-    Runs in a separate process.
-    """
-    import cv2
-    import numpy as np
-    import mediapipe as mpipe
-    from joint_tracker import PoseTracker
-    from human_pose import _draw_pose, _draw_vis_legend
-
-    BaseOptions           = mpipe.tasks.BaseOptions
-    PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
-    PoseLandmarkerOptions = mpipe.tasks.vision.PoseLandmarkerOptions
-    RunningMode           = mpipe.tasks.vision.RunningMode
-
-    n_frames = crop_ef - crop_sf
-    cap      = cv2.VideoCapture(str(rgb_path))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, crop_sf)
-    writer   = None
-    t0_ms    = None
-    prev_ts  = None
-    tracker  = PoseTracker(alpha=0.35, dead_band=3.0) if human_pose else None
-    written  = 0
-    crop_idx = 0
-
-    lm_arr = np.full((n_frames, 33, 4), np.nan, dtype=np.float32)
-
-    mp_options = None
-    if human_pose:
-        mp_options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=RunningMode.VIDEO,
-            min_pose_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-
-    lm_ctx = PoseLandmarker.create_from_options(mp_options) if human_pose else contextlib.nullcontext(None)
-
-    with lm_ctx as landmarker:
-        for _ in range(n_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            stamp = float(ts_arr[crop_idx])
-            h_f, w_f = frame.shape[:2]
-            out_frame = frame.copy()
-
-            if landmarker is not None:
-                if t0_ms is None:
-                    t0_ms = int(stamp * 1000)
-                ts_ms  = max(0, int(stamp * 1000) - t0_ms)
-                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
-                result = landmarker.detect_for_video(mp_img, ts_ms)
-                dt     = (stamp - prev_ts) if prev_ts is not None else 0.0
-                prev_ts = stamp
-                if result.pose_landmarks:
-                    lms = result.pose_landmarks[0]
-                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
-                    vis = np.array([lm.visibility for lm in lms])
-                    tracked = tracker.update(pos, vis, dt)
-                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
-                    for j, lm in enumerate(lms):
-                        lm_arr[crop_idx, j] = [lm.x, lm.y, lm.z, lm.visibility]
-                else:
-                    cv2.putText(out_frame, "No pose", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
-                _draw_vis_legend(out_frame, h_f, w_f)
-
-            if writer is None:
-                writer = cv2.VideoWriter(
-                    str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w_f, h_f)
-                )
-            writer.write(out_frame)
-            crop_idx += 1
-            written  += 1
-            if written % 200 == 0:
-                print(f"  [other] {written}/{n_frames} frames written")
-
-    cap.release()
-    if writer:
-        writer.release()
-
-    np.save(str(lm_save_path), lm_arr[:crop_idx])   # trim to actual frames written
-    print(f"  [other] Done: {written} frames → {out_path}")
-    print(f"  [other] Landmarks saved → {lm_save_path}")
-
-
-# ==========================================
 # --- TRAJECTORY POST-PROCESSING ---
 # ==========================================
 
-RETURN_THRESH_MM = 30.0   # Z-distance from start to count as "returned"
-MIN_CYCLE_SEC    = 6.0    # minimum cycle duration — ignores brief returns
+RETURN_THRESH_MM = 30.0
+MIN_CYCLE_SEC    = 6.0
 
 
 def _ensure_quat_continuity(quats):
-    """Flip quaternions so consecutive ones are on the same hemisphere."""
     for i in range(1, len(quats)):
         if np.dot(quats[i], quats[i - 1]) < 0:
             quats[i] = -quats[i]
@@ -433,17 +282,10 @@ def _ensure_quat_continuity(quats):
 
 
 def _interpolate_full(t, frames, pos, euler, fps):
-    """
-    Interpolate sparse CSV (missing frames due to ArUco occlusion) into a
-    complete trajectory with one row per video frame.
-    Uses cubic spline (C2 smooth) instead of linear interp to avoid
-    velocity discontinuities at gap boundaries.
-    """
     f_min, f_max = int(frames[0]), int(frames[-1])
     all_frames = np.arange(f_min, f_max + 1)
     all_t = all_frames / fps
 
-    # Cubic spline for position — C2 continuous across gaps
     full_pos = np.zeros((len(all_frames), 3))
     for ax in range(3):
         cs = CubicSpline(frames, pos[:, ax], bc_type="clamped")
@@ -463,10 +305,6 @@ def _interpolate_full(t, frames, pos, euler, fps):
 
 
 def _detect_cycles(t, pos, thresh_mm, min_sec):
-    """
-    Find cycle start indices by detecting when the gripper height (Z)
-    returns close to its starting height.
-    """
     start_z = pos[0, 2]
     dist = np.abs(pos[:, 2] - start_z)
     close_mask = dist < thresh_mm
@@ -559,10 +397,6 @@ FLASH_FRAMES = 15
 
 
 def _annotate_video_cycles(video_path, cycle_start_frames):
-    """
-    Re-read the annotated video, overlay cycle markers, and overwrite it.
-    cycle_start_frames: dict mapping video frame index → cycle number.
-    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"  Cannot open video for cycle annotation: {video_path}")
@@ -572,7 +406,6 @@ def _annotate_video_cycles(video_path, cycle_start_frames):
     w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Write to a temp file, then replace original
     tmp_path = Path(video_path).with_suffix(".tmp.mp4")
     writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
@@ -591,15 +424,9 @@ def _annotate_video_cycles(video_path, cycle_start_frames):
 
         if current_cycle > 0:
             color = CYCLE_COLORS[(current_cycle - 1) % len(CYCLE_COLORS)]
-
-            # Colored bar at top
             cv2.rectangle(frame, (0, 0), (w, 6), color, -1)
-
-            # Persistent label
             cv2.putText(frame, f"Cycle {current_cycle}", (w - 140, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-            # Flash banner
             if flash_remaining > 0:
                 banner = f"CYCLE {current_cycle} START"
                 ts = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
@@ -619,14 +446,12 @@ def _annotate_video_cycles(video_path, cycle_start_frames):
     cap.release()
     writer.release()
 
-    # Replace original with annotated version
     import shutil
     shutil.move(str(tmp_path), str(video_path))
     print(f"  Annotated video with cycle markers: {video_path}  ({frame_idx} frames)")
 
 
-def _read_sparse_csv(sparse_csv_path):
-    """Read sparse gripper CSV and return (t, frame, pos, euler) arrays."""
+def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None):
     rows = []
     with open(sparse_csv_path, "r") as f:
         for row in csv.DictReader(f):
@@ -637,78 +462,13 @@ def _read_sparse_csv(sparse_csv_path):
                         float(r["pos_z"])]  for r in rows])
     euler = np.array([[float(r["orient_x"]), float(r["orient_y"]),
                         float(r["orient_z"])] for r in rows])
-    return t, frame, pos, euler
 
-
-MIRROR_DWELL_SEC = 0.5  # pause at the turnaround point (seconds)
-
-
-def _mirror_trajectory(t, frames, pos, euler, fps):
-    """Append a time-reversed copy so the trajectory goes A→B→A.
-
-    Inserts a short dwell (MIRROR_DWELL_SEC) at the turnaround point so
-    the cubic spline in arm_optimo.py sees a flat segment and naturally
-    produces zero velocity at the junction — no discontinuous motion.
-    """
-    dt_frame = 1.0 / fps
-    n_dwell  = max(1, int(MIRROR_DWELL_SEC * fps))
-
-    # Dwell: repeat the endpoint for n_dwell frames
-    dwell_t      = t[-1] + dt_frame * np.arange(1, n_dwell + 1)
-    dwell_frames = frames[-1] + np.arange(1, n_dwell + 1).astype(float)
-    dwell_pos    = np.tile(pos[-1], (n_dwell, 1))
-    dwell_euler  = np.tile(euler[-1], (n_dwell, 1))
-
-    # Reversed segment (skip first point = same as last dwell point)
-    t_after_dwell = dwell_t[-1]
-    t_rev     = t_after_dwell + (t[-1] - t[::-1]) + dt_frame
-    f_rev     = dwell_frames[-1] + np.arange(1, len(t) + 1).astype(float)
-    pos_rev   = pos[::-1].copy()
-    euler_rev = euler[::-1].copy()
-
-    t_out     = np.concatenate([t,      dwell_t,      t_rev[1:]])
-    f_out     = np.concatenate([frames, dwell_frames,  f_rev[1:]])
-    pos_out   = np.concatenate([pos,    dwell_pos,     pos_rev[1:]], axis=0)
-    euler_out = np.concatenate([euler,  dwell_euler,   euler_rev[1:]], axis=0)
-    print(f"  Mirror: {len(t)} → {len(t_out)} frames "
-          f"(dwell={MIRROR_DWELL_SEC}s, duration {t_out[-1]:.2f}s)")
-    return t_out, f_out, pos_out, euler_out
-
-
-def interpolate_trajectory(sparse_csv_path, fps, out_dir, data_name, mirror=False):
-    """
-    Interpolate sparse CSV to one row per frame, optionally mirror,
-    and save as <data_name>.traj.
-    """
-    t, frame, pos, euler = _read_sparse_csv(sparse_csv_path)
     t_full, frames_full, pos_full, euler_full = _interpolate_full(
         t, frame, pos, euler, fps)
 
-    if mirror:
-        t_full, frames_full, pos_full, euler_full = _mirror_trajectory(
-            t_full, frames_full, pos_full, euler_full, fps)
-
-    main_path = Path(out_dir) / f"{data_name}.csv"
-    _write_traj_csv(main_path, t_full, frames_full, pos_full, euler_full)
-
-
-def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None):
-    """
-    Read the sparse gripper CSV, interpolate to full, detect cycles,
-    average them, save full as <data_name>_full.csv and averaged as
-    <data_name>.csv, and annotate the video with cycle markers.
-    """
-    t, frame, pos, euler = _read_sparse_csv(sparse_csv_path)
-
-    # Interpolate to one row per video frame
-    t_full, frames_full, pos_full, euler_full = _interpolate_full(
-        t, frame, pos, euler, fps)
-
-    # Save full trajectory
     full_path = Path(out_dir) / f"{data_name}_full.csv"
     _write_traj_csv(full_path, t_full, frames_full, pos_full, euler_full)
 
-    # Detect cycles
     starts = _detect_cycles(t_full, pos_full, RETURN_THRESH_MM, MIN_CYCLE_SEC)
 
     print(f"\n  Detected {len(starts)} cycles "
@@ -720,17 +480,21 @@ def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None
               f"{pos_full[si, 2]:<12.2f}")
 
     if len(starts) < 2:
-        print("  Only 1 cycle detected — saving full trajectory as the main traj")
+        print("  Only 1 cycle detected — saving full trajectory as the main CSV")
         avg_path = Path(out_dir) / f"{data_name}.csv"
         _write_traj_csv(avg_path, t_full, frames_full, pos_full, euler_full)
         return
 
-    # Annotate video with cycle markers
     if video_path is not None and Path(video_path).exists():
         cycle_frame_map = {}
         for ci, si in enumerate(starts):
             cycle_frame_map[int(frames_full[si])] = ci + 1
         _annotate_video_cycles(video_path, cycle_frame_map)
+
+    if len(starts) < 2:
+        avg_path = Path(out_dir) / f"{data_name}.csv"
+        _write_traj_csv(avg_path, t_full, frames_full, pos_full, euler_full)
+        return
 
     segments_pos, segments_euler, segments_dur = [], [], []
     for i in range(len(starts) - 1):
@@ -748,7 +512,6 @@ def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None
     print(f"  Using {n_cycles} complete cycles (dropped last incomplete segment)")
     print(f"  Durations: " + ", ".join(f"{d:.2f}s" for d in segments_dur))
 
-    # Resample to common length (shortest duration)
     min_dur = min(segments_dur)
     median_len = int(np.median([len(s[0]) for s in segments_pos]))
     t_common = np.linspace(0, min_dur, median_len)
@@ -761,11 +524,9 @@ def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None
         pos_stack[k]   = _resample_pos(t_seg, p_seg, t_common)
         euler_stack[k] = _resample_orient(t_seg, e_seg, t_common)
 
-    # Average
     pos_mean   = pos_stack.mean(axis=0)
     euler_mean = _average_orientations(euler_stack)
 
-    # Save averaged trajectory as the main traj
     avg_path = Path(out_dir) / f"{data_name}.csv"
     avg_frames = np.arange(len(t_common), dtype=float)
     _write_traj_csv(avg_path, t_common, avg_frames, pos_mean, euler_mean)
@@ -777,13 +538,18 @@ def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None
 # --- MAIN PROCESSOR ---
 # ==========================================
 
-class TwoCamProcessor:
+class RosbagProcessor:
+    """
+    Two-pass streaming processor.  Reads the bag twice so that frames are
+    never buffered — only small detection dicts and timestamps are kept.
+    """
+
     def __init__(self):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        if not DATA_DIR.exists():
+        if not BAG_PATH.exists():
             raise FileNotFoundError(
-                f"Data directory not found: {DATA_DIR}\n"
-                "Run read_rosbag.py first to extract the bag."
+                f"Bag not found: {BAG_PATH}\n"
+                "Check BAG_PATH at the top of this script."
             )
         if HUMAN_POSE and not Path(MODEL_PATH).exists():
             raise FileNotFoundError(
@@ -793,17 +559,12 @@ class TwoCamProcessor:
 
         gcam  = "left"  if GRIPPER_CAM == "left" else "right"
         other = "right" if GRIPPER_CAM == "left" else "left"
+        self._gcam_side  = gcam
+        self._other_side = other
 
-        self._gcam_rgb    = DATA_DIR / f"{gcam}.mp4"
-        self._other_rgb   = DATA_DIR / f"{other}.mp4"
-        self._gcam_ts     = np.load(str(DATA_DIR / f"{gcam}_ts.npy"))
-        self._other_ts    = np.load(str(DATA_DIR / f"{other}_ts.npy"))
-        self._gcam_depth_dir = DATA_DIR / f"{gcam}_depth"
-        self._gcam_depth_ts  = (
-            np.load(str(DATA_DIR / f"{gcam}_depth_ts.npy"))
-            if (DATA_DIR / f"{gcam}_depth_ts.npy").exists() else np.array([])
-        )
-        self._other_cam_name = other
+        self._gcam_topic       = LEFT_TOPIC       if gcam == "left" else RIGHT_TOPIC
+        self._other_topic      = RIGHT_TOPIC      if gcam == "left" else LEFT_TOPIC
+        self._gcam_depth_topic = LEFT_DEPTH_TOPIC  if gcam == "left" else RIGHT_DEPTH_TOPIC
 
         aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         aruco_params = cv2.aruco.DetectorParameters()
@@ -821,148 +582,299 @@ class TwoCamProcessor:
         self._aruco_det = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
     # ------------------------------------------------------------------
-    # Orchestrator
+    # Pass 1: Stream bag → ArUco detection (no frame buffering)
     # ------------------------------------------------------------------
 
-    def run(self):
-        gcam_ts  = self._gcam_ts
-        other_ts = self._other_ts
-
-        # Apply crop to both cameras independently
-        sf_gcam,  ef_gcam  = _crop_frame_range(gcam_ts,  CROP, CROP_UNIT)
-        sf_other, ef_other = _crop_frame_range(other_ts, CROP, CROP_UNIT)
-        gcam_ts  = gcam_ts[sf_gcam:ef_gcam]
-        other_ts = other_ts[sf_other:ef_other]
-        print(f"  Gripper cam: {len(gcam_ts)} frames  |  Other cam: {len(other_ts)} frames")
-
-        fps_gcam  = fps_from_timestamps(gcam_ts)  if len(gcam_ts)  >= 2 else 30.0
-        fps_other = fps_from_timestamps(other_ts) if len(other_ts) >= 2 else 30.0
-        print(f"  FPS — gcam: {fps_gcam:.3f}  other: {fps_other:.3f}")
-
-        # ── Force data: crop by same time window in seconds ───────────
-        force_cropped = self._load_and_crop_force()
-
-        # ── Pass 1: ArUco detection (sequential, fast) ────────────────
-        print("Pass 1: ArUco detection on gripper camera...")
-        per_frame_dets_all = self._pass1_aruco(gcam_ts, sf_gcam)
-
-        gripper_poses_raw = self._build_gripper_poses(per_frame_dets_all)
-        gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
-
-        sparse_csv = self._save_csv(gripper_poses, gcam_ts)
-
-        # ── Pass 2: MediaPipe annotation, two cameras in parallel ─────
-        print("Pass 2: Parallel MediaPipe annotation...")
-        stem = DATA_NAME
-        if GRIPPER_CAM == "left":
-            gcam_out_path  = OUT_DIR / f"{stem}_left.mp4"
-            other_out_path = OUT_DIR / f"{stem}_right.mp4"
-        else:
-            gcam_out_path  = OUT_DIR / f"{stem}_right.mp4"
-            other_out_path = OUT_DIR / f"{stem}_left.mp4"
-
-        lm_tmp_path = OUT_DIR / "_tmp_landmarks.npy"
-
-        # Determine other-cam frame dimensions for rule book
-        other_cap = cv2.VideoCapture(str(self._other_rgb))
-        other_hw  = (int(other_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                     int(other_cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        other_cap.release()
-
-        p_gcam = mp.Process(
-            target=_gcam_worker,
-            args=(
-                str(self._gcam_rgb),
-                gcam_ts, sf_gcam, ef_gcam,
-                per_frame_dets_all, gripper_poses,
-                fps_gcam, str(gcam_out_path),
-                False, MODEL_PATH,
-            ),
-        )
-        p_other = mp.Process(
-            target=_other_worker,
-            args=(
-                str(self._other_rgb),
-                other_ts, sf_other, ef_other,
-                fps_other, str(other_out_path),
-                str(lm_tmp_path),
-                HUMAN_POSE, MODEL_PATH,
-            ),
-        )
-
-        p_gcam.start()
-        p_other.start()
-        p_gcam.join()
-        p_other.join()
-
-        if p_gcam.exitcode != 0:
-            print(f"  WARNING: gcam worker exited with code {p_gcam.exitcode}")
-        if p_other.exitcode != 0:
-            print(f"  WARNING: other worker exited with code {p_other.exitcode}")
-
-        # ── Rule book (from landmarks saved by other worker) ──────────
-        if HUMAN_POSE and lm_tmp_path.exists():
-            print("Computing patient joint-angle rule book...")
-            lm_arr = np.load(str(lm_tmp_path))
-            self._compute_and_save_rule_book(lm_arr, other_hw, self._other_cam_name)
-            lm_tmp_path.unlink(missing_ok=True)
-
-        # ── Force rule book ───────────────────────────────────────────
-        if force_cropped is not None and len(force_cropped) > 0:
-            self._save_force_rules(force_cropped)
-
-        # ── Interpolate + cycle-average trajectory + annotate video ───
-        if sparse_csv is not None:
-            if GRIPPER_PROCESS == "cycle":
-                average_trajectory(sparse_csv, fps_gcam, str(OUT_DIR),
-                                   DATA_NAME, str(gcam_out_path))
-            else:  # "pick"
-                interpolate_trajectory(sparse_csv, fps_gcam, str(OUT_DIR),
-                                       DATA_NAME, mirror=IF_MIRROR)
-
-    # ------------------------------------------------------------------
-    # Pass 1: ArUco detection from video file
-    # ------------------------------------------------------------------
-
-    def _pass1_aruco(self, gcam_ts, start_frame):
+    def _pass1_aruco(self):
         """
-        Read gripper-cam video frame-by-frame, detect ArUco per frame.
-        Depth is loaded from 16-bit PNG files when available.
-        Returns per_frame_dets: list[list[dict]] aligned to gcam_ts.
+        Stream through the bag once.  For each gripper-cam frame, run ArUco
+        detection with the nearest depth frame, then discard the image.
+        Collects timestamps for all topics (needed for crop + FPS).
+
+        Returns:
+            gcam_ts, other_ts:  1-D float64 arrays of all timestamps
+            per_frame_dets:     list[list[dict]] — ArUco dets per gcam frame
+            depth_ts:           1-D float64 array of depth timestamps
         """
-        n_frames = len(gcam_ts)
-        depth_ts = self._gcam_depth_ts
-        depth_dir = self._gcam_depth_dir
-        has_depth = depth_dir.exists() and len(depth_ts) > 0
+        print(f"Pass 1: Streaming bag for ArUco detection — {BAG_PATH} ...")
 
-        cap = cv2.VideoCapture(str(self._gcam_rgb))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        per_frame_dets = []
+        topics = {self._gcam_topic, self._other_topic, self._gcam_depth_topic}
 
-        for crop_idx in range(n_frames):
-            ret, frame = cap.read()
-            if not ret:
-                per_frame_dets.append([])
-                continue
+        gcam_ts_list  = []
+        other_ts_list = []
+        depth_ts_list = []
+        per_frame_dets_all = []   # one entry per gcam frame (before crop)
 
-            depth_img = None
-            if has_depth:
-                di = _find_depth_idx(depth_ts, float(gcam_ts[crop_idx]))
-                if di is not None:
-                    dp = depth_dir / f"{di:06d}.png"
-                    if dp.exists():
-                        depth_img = cv2.imread(str(dp), cv2.IMREAD_ANYDEPTH)
+        # Rolling buffer: keep the most recent depth frame for matching
+        _last_depth_img   = None
+        _last_depth_stamp = None
 
-            dets = self._detect_aruco_frame(frame, depth_img)
-            per_frame_dets.append(dets)
+        n_msg = 0
 
-            if (crop_idx + 1) % 500 == 0:
-                print(f"  Pass 1: {crop_idx + 1}/{n_frames} frames")
+        with AnyReader([BAG_PATH], default_typestore=typestore) as reader:
+            conns = [c for c in reader.connections if c.topic in topics]
+            if not conns:
+                raise RuntimeError(f"No matching topics found in bag: {topics}")
 
-        cap.release()
-        total_dets = sum(len(d) for d in per_frame_dets)
-        print(f"  ArUco: {total_dets} detections across {n_frames} frames")
-        return per_frame_dets
+            for conn, ts_ns, raw in reader.messages(connections=conns):
+                topic = conn.topic
+                try:
+                    msg   = typestore.deserialize_cdr(raw, conn.msgtype)
+                    stamp = _get_stamp(msg, ts_ns)
+                except Exception as e:
+                    print(f"  Warning: deserialize failed ({topic}): {e}")
+                    continue
+
+                # ── Depth (update rolling buffer) ────────────────────────
+                if topic == self._gcam_depth_topic:
+                    try:
+                        _last_depth_img   = _ros_depth_to_array(msg)
+                        _last_depth_stamp = stamp
+                        depth_ts_list.append(stamp)
+                    except Exception as e:
+                        print(f"  Warning: depth skip: {e}")
+                    n_msg += 1
+                    continue
+
+                # ── Gripper camera: ArUco detect + discard ───────────────
+                if topic == self._gcam_topic:
+                    try:
+                        frame = _ros_image_to_bgr(msg)
+                    except Exception as e:
+                        print(f"  Warning: gcam RGB skip: {e}")
+                        per_frame_dets_all.append([])
+                        gcam_ts_list.append(stamp)
+                        n_msg += 1
+                        continue
+
+                    # Match nearest depth by timestamp
+                    depth_img = None
+                    if _last_depth_stamp is not None:
+                        if abs(_last_depth_stamp - stamp) <= 0.05:
+                            depth_img = _last_depth_img
+
+                    dets = self._detect_aruco_frame(frame, depth_img)
+                    per_frame_dets_all.append(dets)
+                    gcam_ts_list.append(stamp)
+                    # frame is discarded here (not stored)
+
+                # ── Other camera: timestamp only ─────────────────────────
+                elif topic == self._other_topic:
+                    other_ts_list.append(stamp)
+
+                n_msg += 1
+                if n_msg % 3000 == 0:
+                    print(f"  {n_msg} messages | gcam={len(gcam_ts_list)} "
+                          f"other={len(other_ts_list)} depth={len(depth_ts_list)}")
+
+        gcam_ts  = np.array(gcam_ts_list,  dtype=np.float64)
+        other_ts = np.array(other_ts_list, dtype=np.float64)
+        depth_ts = np.array(depth_ts_list, dtype=np.float64)
+
+        print(f"  Gripper cam ({self._gcam_side}):  {len(gcam_ts)} frames")
+        print(f"  Other cam   ({self._other_side}): {len(other_ts)} frames")
+        print(f"  Depth:                {len(depth_ts)} frames")
+
+        total_dets = sum(len(d) for d in per_frame_dets_all)
+        print(f"  ArUco: {total_dets} detections across {len(gcam_ts)} frames")
+
+        return gcam_ts, other_ts, depth_ts, per_frame_dets_all
+
+    # ------------------------------------------------------------------
+    # Pass 2: Stream bag → MediaPipe + annotated video (no frame buffering)
+    # ------------------------------------------------------------------
+
+    def _pass2_annotate(self, gcam_ts_all, other_ts_all,
+                        sf_gcam, ef_gcam, sf_other, ef_other,
+                        per_frame_dets, gripper_poses,
+                        fps_gcam, fps_other,
+                        gcam_out_path, other_out_path):
+        """
+        Stream through the bag a second time.  For each camera frame in the
+        crop window, run MediaPipe and overlay ArUco results (gcam only),
+        then write to video.  Frames are discarded after writing.
+
+        Returns lm_arr (N,33,4) for the other camera (for rule book).
+        """
+        print("Pass 2: Streaming bag for MediaPipe annotation...")
+
+        topics = {self._gcam_topic, self._other_topic}
+
+        # Frame counters (global index in the bag, before crop)
+        gcam_global_idx  = 0
+        other_global_idx = 0
+
+        # Writers
+        gcam_writer  = None
+        other_writer = None
+        gcam_written  = 0
+        other_written = 0
+        n_gcam_crop  = ef_gcam  - sf_gcam
+        n_other_crop = ef_other - sf_other
+
+        # MediaPipe state — gcam
+        gcam_t0_ms    = None
+        gcam_prev_ts  = None
+        gcam_tracker  = PoseTracker(alpha=0.35, dead_band=3.0) if HUMAN_POSE else None
+
+        # MediaPipe state — other
+        other_t0_ms   = None
+        other_prev_ts = None
+        other_tracker = PoseTracker(alpha=0.35, dead_band=3.0) if HUMAN_POSE else None
+
+        # Landmark array for other camera (rule book)
+        lm_arr = np.full((n_other_crop, 33, 4), np.nan, dtype=np.float32)
+
+        # Create MediaPipe landmarkers
+        gcam_lm_ctx  = contextlib.nullcontext(None)
+        other_lm_ctx = contextlib.nullcontext(None)
+        if HUMAN_POSE:
+            gcam_mp_opts = PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=RunningMode.VIDEO,
+                min_pose_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            other_mp_opts = PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=RunningMode.VIDEO,
+                min_pose_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            gcam_lm_ctx  = PoseLandmarker.create_from_options(gcam_mp_opts)
+            other_lm_ctx = PoseLandmarker.create_from_options(other_mp_opts)
+
+        other_hw = None
+
+        with gcam_lm_ctx as gcam_landmarker, other_lm_ctx as other_landmarker:
+            with AnyReader([BAG_PATH], default_typestore=typestore) as reader:
+                conns = [c for c in reader.connections if c.topic in topics]
+
+                for conn, ts_ns, raw in reader.messages(connections=conns):
+                    topic = conn.topic
+                    try:
+                        msg   = typestore.deserialize_cdr(raw, conn.msgtype)
+                        stamp = _get_stamp(msg, ts_ns)
+                    except Exception:
+                        if topic == self._gcam_topic:
+                            gcam_global_idx += 1
+                        elif topic == self._other_topic:
+                            other_global_idx += 1
+                        continue
+
+                    # ── Gripper camera ───────────────────────────────────
+                    if topic == self._gcam_topic:
+                        in_crop = sf_gcam <= gcam_global_idx < ef_gcam
+                        if in_crop:
+                            try:
+                                frame = _ros_image_to_bgr(msg)
+                            except Exception:
+                                gcam_global_idx += 1
+                                continue
+
+                            crop_idx = gcam_global_idx - sf_gcam
+                            h_f, w_f = frame.shape[:2]
+                            out_frame = frame.copy()
+
+                            if gcam_landmarker is not None:
+                                if gcam_t0_ms is None:
+                                    gcam_t0_ms = int(stamp * 1000)
+                                ts_ms = max(0, int(stamp * 1000) - gcam_t0_ms)
+                                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
+                                result = gcam_landmarker.detect_for_video(mp_img, ts_ms)
+                                dt     = (stamp - gcam_prev_ts) if gcam_prev_ts is not None else 0.0
+                                gcam_prev_ts = stamp
+                                if result.pose_landmarks:
+                                    lms = result.pose_landmarks[0]
+                                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
+                                    vis = np.array([lm.visibility for lm in lms])
+                                    tracked = gcam_tracker.update(pos, vis, dt)
+                                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
+                                else:
+                                    cv2.putText(out_frame, "No pose", (10, 30),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                                    gcam_tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
+                                _draw_vis_legend(out_frame, h_f, w_f)
+
+                            dets = per_frame_dets[crop_idx] if crop_idx < len(per_frame_dets) else []
+                            gp   = gripper_poses[crop_idx]  if crop_idx < len(gripper_poses)  else None
+                            _annotate_gcam_frame(out_frame, dets, gp)
+
+                            cv2.putText(out_frame, f"Frame: {crop_idx}", (10, 65),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+                            if gcam_writer is None:
+                                gcam_writer = cv2.VideoWriter(
+                                    str(gcam_out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                    fps_gcam, (w_f, h_f)
+                                )
+                            gcam_writer.write(out_frame)
+                            gcam_written += 1
+                            if gcam_written % 200 == 0:
+                                print(f"  [gcam]  {gcam_written}/{n_gcam_crop} frames written")
+
+                        gcam_global_idx += 1
+
+                    # ── Other camera ─────────────────────────────────────
+                    elif topic == self._other_topic:
+                        in_crop = sf_other <= other_global_idx < ef_other
+                        if in_crop:
+                            try:
+                                frame = _ros_image_to_bgr(msg)
+                            except Exception:
+                                other_global_idx += 1
+                                continue
+
+                            crop_idx = other_global_idx - sf_other
+                            h_f, w_f = frame.shape[:2]
+                            if other_hw is None:
+                                other_hw = (h_f, w_f)
+                            out_frame = frame.copy()
+
+                            if other_landmarker is not None:
+                                if other_t0_ms is None:
+                                    other_t0_ms = int(stamp * 1000)
+                                ts_ms = max(0, int(stamp * 1000) - other_t0_ms)
+                                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                mp_img = mpipe.Image(image_format=mpipe.ImageFormat.SRGB, data=rgb)
+                                result = other_landmarker.detect_for_video(mp_img, ts_ms)
+                                dt     = (stamp - other_prev_ts) if other_prev_ts is not None else 0.0
+                                other_prev_ts = stamp
+                                if result.pose_landmarks:
+                                    lms = result.pose_landmarks[0]
+                                    pos = np.array([[lm.x * w_f, lm.y * h_f, lm.z * w_f] for lm in lms])
+                                    vis = np.array([lm.visibility for lm in lms])
+                                    tracked = other_tracker.update(pos, vis, dt)
+                                    _draw_pose(out_frame, lms, tracked, h_f, w_f)
+                                    for j, lm in enumerate(lms):
+                                        lm_arr[crop_idx, j] = [lm.x, lm.y, lm.z, lm.visibility]
+                                else:
+                                    cv2.putText(out_frame, "No pose", (10, 30),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                                    other_tracker.update(np.zeros((33, 3)), np.zeros(33), dt)
+                                _draw_vis_legend(out_frame, h_f, w_f)
+
+                            if other_writer is None:
+                                other_writer = cv2.VideoWriter(
+                                    str(other_out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                    fps_other, (w_f, h_f)
+                                )
+                            other_writer.write(out_frame)
+                            other_written += 1
+                            if other_written % 200 == 0:
+                                print(f"  [other] {other_written}/{n_other_crop} frames written")
+
+                        other_global_idx += 1
+
+        if gcam_writer:
+            gcam_writer.release()
+        if other_writer:
+            other_writer.release()
+        print(f"  [gcam]  Done: {gcam_written} frames → {gcam_out_path}")
+        print(f"  [other] Done: {other_written} frames → {other_out_path}")
+
+        return lm_arr[:other_written] if HUMAN_POSE else None, other_hw
 
     # ------------------------------------------------------------------
     # ArUco detection (single frame)
@@ -1049,21 +961,78 @@ class TwoCamProcessor:
         return poses
 
     # ------------------------------------------------------------------
+    # Force helpers
+    # ------------------------------------------------------------------
+
+    def _read_force(self):
+        if not PROCESS_ONBOARD:
+            return None
+        if not ONBOARD_BAG_PATH.exists():
+            print(f"  Force: onboard bag not found: {ONBOARD_BAG_PATH}")
+            return None
+        print(f"  Reading force from {ONBOARD_BAG_PATH} ...")
+        from read_onboard import read_wrench_force
+        force_data = read_wrench_force(ONBOARD_BAG_PATH, topic_name=FORCE_TOPIC)
+        print(f"  Force: {len(force_data)} samples, "
+              f"duration={force_data[-1, 0]:.1f}s")
+        return force_data
+
+    def _crop_force(self, force_data):
+        if force_data is None:
+            return None
+        if CROP_UNIT != "s":
+            return force_data
+        if CROP is None:
+            print(f"  Force: {len(force_data)} samples (no crop)")
+            return force_data
+
+        force_t = force_data[:, 0]
+        dur_f   = float(force_t[-1])
+        t_start = float(CROP[0]) if float(CROP[0]) >= 0 else dur_f + float(CROP[0])
+        t_end   = float(CROP[1]) if float(CROP[1]) >= 0 else dur_f + float(CROP[1])
+        sf_f = int(np.searchsorted(force_t, max(0.0, t_start), side="left"))
+        ef_f = int(np.searchsorted(force_t, max(0.0, t_end),   side="left"))
+        cropped = force_data[sf_f:ef_f]
+        print(f"  Force: {len(cropped)} samples kept (t={t_start:.2f}s → {t_end:.2f}s)")
+        return cropped
+
+    def _save_force_rules(self, force_data):
+        axis_stats = {}
+        for col, name in enumerate(("Fx", "Fy", "Fz"), start=1):
+            vals = force_data[:, col]
+            axis_stats[name] = {
+                "n_samples": int(len(vals)),
+                "min_N":     round(float(np.min(vals)),  2),
+                "max_N":     round(float(np.max(vals)),  2),
+                "mean_N":    round(float(np.mean(vals)), 2),
+                "std_N":     round(float(np.std(vals)),  2),
+            }
+        doc = {
+            "source":     DATA_NAME,
+            "generated":  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "crop":       list(CROP) if CROP is not None else None,
+            "n_samples":  int(len(force_data)),
+            "duration_s": round(float(force_data[-1, 0] - force_data[0, 0]), 3),
+            "force_axes": axis_stats,
+        }
+        yaml_path = OUT_DIR / f"{DATA_NAME}_force_rules.yaml"
+        with open(yaml_path, "w") as f:
+            f.write("# Force rule book (Fx, Fy, Fz from /rokubi/wrench)\n")
+            f.write("# Units: Newtons. Cropped to same time window as trajectory.\n\n")
+            yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
+        print(f"  Saved force rule book: {yaml_path}")
+
+    # ------------------------------------------------------------------
     # Rule book
     # ------------------------------------------------------------------
 
     def _compute_and_save_rule_book(self, lm_arr, frame_hw, cam_name):
-        """
-        lm_arr: (N, 33, 4) float32 — columns [x, y, z, visibility].
-                NaN rows = frames with no MediaPipe detection.
-        """
         if lm_arr.ndim != 3 or lm_arr.shape[1:] != (33, 4):
             print("  Rule book: unexpected landmark array shape, skipping.")
             return
 
         h, w = frame_hw
         all_joints = set(POSE_RULE_JOINTS)
-
         triplet_samples = {n: [] for n in JOINT_ANGLE_TRIPLETS}
 
         for frame_data in lm_arr:
@@ -1132,67 +1101,6 @@ class TwoCamProcessor:
         print(f"  Saved rule book ({total} angles, {n_valid} frames): {yaml_path}")
 
     # ------------------------------------------------------------------
-    # Force helpers
-    # ------------------------------------------------------------------
-
-    def _load_and_crop_force(self):
-        """Load force_raw.npy and slice to the same relative time window as CROP.
-
-        force_raw[:, 0] is relative time (zeroed at first force sample).
-        CROP is applied as the same number of seconds from each stream's own start/end.
-        Returns cropped (N, 4) array or None if file missing or CROP_UNIT != "s".
-        """
-        force_path = DATA_DIR / "force_raw.npy"
-        if not force_path.exists():
-            print("  Force: force_raw.npy not found, skipping force rule book.")
-            return None
-        if CROP_UNIT != "s":
-            print("  Force: CROP_UNIT != 's', skipping time-based force crop.")
-            return np.load(str(force_path))
-
-        force_raw = np.load(str(force_path))  # (N, 4): [t_rel, Fx, Fy, Fz]
-        if CROP is None:
-            print(f"  Force: {len(force_raw)} samples (no crop)")
-            return force_raw
-
-        force_t = force_raw[:, 0]
-        dur_f   = float(force_t[-1])
-        t_start = float(CROP[0]) if float(CROP[0]) >= 0 else dur_f + float(CROP[0])
-        t_end   = float(CROP[1]) if float(CROP[1]) >= 0 else dur_f + float(CROP[1])
-        sf_f = int(np.searchsorted(force_t, max(0.0, t_start), side="left"))
-        ef_f = int(np.searchsorted(force_t, max(0.0, t_end),   side="left"))
-        cropped = force_raw[sf_f:ef_f]
-        print(f"  Force: {len(cropped)} samples kept (t={t_start:.2f}s → {t_end:.2f}s)")
-        return cropped
-
-    def _save_force_rules(self, force_data):
-        """Save per-axis Fx/Fy/Fz min/max/mean/std from cropped force data."""
-        axis_stats = {}
-        for col, name in enumerate(("Fx", "Fy", "Fz"), start=1):
-            vals = force_data[:, col]
-            axis_stats[name] = {
-                "n_samples": int(len(vals)),
-                "min_N":     round(float(np.min(vals)),  2),
-                "max_N":     round(float(np.max(vals)),  2),
-                "mean_N":    round(float(np.mean(vals)), 2),
-                "std_N":     round(float(np.std(vals)),  2),
-            }
-        doc = {
-            "source":     DATA_NAME,
-            "generated":  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "crop":       list(CROP) if CROP is not None else None,
-            "n_samples":  int(len(force_data)),
-            "duration_s": round(float(force_data[-1, 0] - force_data[0, 0]), 3),
-            "force_axes": axis_stats,
-        }
-        yaml_path = OUT_DIR / f"{DATA_NAME}_force_rules.yaml"
-        with open(yaml_path, "w") as f:
-            f.write("# Force rule book (Fx, Fy, Fz from /rokubi/wrench)\n")
-            f.write("# Units: Newtons. Cropped to same time window as trajectory.\n\n")
-            yaml.dump(doc, f, default_flow_style=False, sort_keys=False)
-        print(f"  Saved force rule book: {yaml_path}")
-
-    # ------------------------------------------------------------------
     # CSV saving
     # ------------------------------------------------------------------
 
@@ -1228,10 +1136,75 @@ class TwoCamProcessor:
         print(f"  Saved sparse gripper trajectory: {csv_path}")
         return csv_path
 
+    # ------------------------------------------------------------------
+    # Orchestrator
+    # ------------------------------------------------------------------
+
+    def run(self):
+        # Pass 1: stream bag → ArUco detection (no frames stored)
+        gcam_ts_all, other_ts_all, depth_ts, per_frame_dets_all = self._pass1_aruco()
+
+        # Read force data (separate bag, small)
+        force_data = self._read_force()
+
+        # Apply crop
+        sf_gcam,  ef_gcam  = _crop_frame_range(gcam_ts_all,  CROP, CROP_UNIT)
+        sf_other, ef_other = _crop_frame_range(other_ts_all, CROP, CROP_UNIT)
+
+        gcam_ts  = gcam_ts_all[sf_gcam:ef_gcam]
+        other_ts = other_ts_all[sf_other:ef_other]
+        per_frame_dets = per_frame_dets_all[sf_gcam:ef_gcam]
+        print(f"  Gripper cam: {len(gcam_ts)} frames  |  Other cam: {len(other_ts)} frames")
+
+        fps_gcam  = fps_from_timestamps(gcam_ts)  if len(gcam_ts)  >= 2 else 30.0
+        fps_other = fps_from_timestamps(other_ts) if len(other_ts) >= 2 else 30.0
+        print(f"  FPS — gcam: {fps_gcam:.3f}  other: {fps_other:.3f}")
+
+        # Crop force data
+        force_cropped = self._crop_force(force_data)
+
+        # Build and smooth gripper poses from cropped detections
+        print("Building gripper poses...")
+        gripper_poses_raw = self._build_gripper_poses(per_frame_dets)
+        gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
+        sparse_csv = self._save_csv(gripper_poses, gcam_ts)
+
+        # Output paths
+        stem = DATA_NAME
+        if GRIPPER_CAM == "left":
+            gcam_out_path  = OUT_DIR / f"{stem}_left.mp4"
+            other_out_path = OUT_DIR / f"{stem}_right.mp4"
+        else:
+            gcam_out_path  = OUT_DIR / f"{stem}_right.mp4"
+            other_out_path = OUT_DIR / f"{stem}_left.mp4"
+
+        # Pass 2: stream bag again → MediaPipe + annotated video
+        lm_arr, other_hw = self._pass2_annotate(
+            gcam_ts_all, other_ts_all,
+            sf_gcam, ef_gcam, sf_other, ef_other,
+            per_frame_dets, gripper_poses,
+            fps_gcam, fps_other,
+            gcam_out_path, other_out_path,
+        )
+
+        # Post-processing
+        if HUMAN_POSE and lm_arr is not None and other_hw is not None:
+            print("Computing patient joint-angle rule book...")
+            self._compute_and_save_rule_book(lm_arr, other_hw, self._other_side)
+
+        if force_cropped is not None and len(force_cropped) > 0:
+            self._save_force_rules(force_cropped)
+
+        if sparse_csv is not None:
+            average_trajectory(sparse_csv, fps_gcam, str(OUT_DIR),
+                               DATA_NAME, str(gcam_out_path))
+
+        print("\nDone.")
+
 
 # ==========================================
 # --- ENTRY POINT ---
 # ==========================================
 
 if __name__ == "__main__":
-    TwoCamProcessor().run()
+    RosbagProcessor().run()

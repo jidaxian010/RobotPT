@@ -14,9 +14,10 @@ from rosbag_reader import AnyReader, typestore
 
 
 TOPIC_NAME = "/rokubi/wrench"
-DEFAULT_DATA_NAME = "yihenga2_onboard"
-DEFAULT_BAG_PATH = Path(f"/home/jdx/Downloads/{DEFAULT_DATA_NAME}")
-OUT_DIR = Path("posEstimate/data")
+DEFAULT_DATA_NAME = "P3-A3"
+ONBOARD_NAME = "WearableData-03-08-26-16-27-33"
+DEFAULT_BAG_PATH = Path(f"posEstimate/data/P3-A3/{ONBOARD_NAME}")
+OUT_DIR = Path("posEstimate/data/P3-A3")
 
 
 def get_stamp(msg, fallback_ns):
@@ -181,7 +182,7 @@ def save_force_rule_book(clean_data, bag_path, topic_name=TOPIC_NAME):
     }
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    rules_path = OUT_DIR / f"{bag_name}_force_rules.yaml"
+    rules_path = OUT_DIR / f"{DEFAULT_DATA_NAME}_force_rules.yaml"
     with open(rules_path, "w") as f:
         f.write("# Force rule book\n")
         f.write("# Units are Newtons. Use min_N/max_N as per-axis safe-range limits.\n")

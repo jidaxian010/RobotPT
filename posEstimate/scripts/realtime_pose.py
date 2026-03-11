@@ -92,8 +92,8 @@ def main():
     pipeline = rs.pipeline()
     config = rs.config()
 
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 60)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 60)
+    config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
     print("Starting pipeline...")
     profile = pipeline.start(config)
@@ -124,6 +124,17 @@ def main():
 
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     parameters = cv2.aruco.DetectorParameters()
+    parameters.adaptiveThreshWinSizeMin = 3
+    parameters.adaptiveThreshWinSizeMax = 53
+    parameters.adaptiveThreshWinSizeStep = 4
+    parameters.adaptiveThreshConstant = 7
+    parameters.minMarkerPerimeterRate = 0.01
+    parameters.maxMarkerPerimeterRate = 4.0
+    parameters.polygonalApproxAccuracyRate = 0.05
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    parameters.cornerRefinementWinSize = 5
+    parameters.cornerRefinementMaxIterations = 50
+    parameters.cornerRefinementMinAccuracy = 0.01
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
     print("Tracking multi-tag surface...")
@@ -144,7 +155,9 @@ def main():
 
             color_image = np.asanyarray(color_frame.get_data())
 
-            corners, ids, rejected = detector.detectMarkers(color_image)
+            blur = cv2.GaussianBlur(color_image, (0, 0), sigmaX=5)
+            sharp = cv2.addWeighted(color_image, 2.0, blur, -1.0, 0)
+            corners, ids, rejected = detector.detectMarkers(sharp)
 
             # Lists to hold the estimates for frame k from all visible tags
             k_positions = []
