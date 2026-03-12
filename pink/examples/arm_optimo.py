@@ -37,8 +37,8 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-DATA_NAME  = "P3-B2"  # for default CSV path; edit one value here
-MOTION   = "b"     # "a" or "b": initial arm configuration
+DATA_NAME  = "P3-A3"  # for default CSV path; edit one value here
+MOTION   = "a"     # "a" or "b": initial arm configuration
 RUN_MODE = "once"  # "loop" or "once"
 TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 
@@ -224,6 +224,49 @@ def plot_joint_trajectory(records):
     plt.show()
 
 
+def plot_ee_trajectory(records):
+    """Plot EE position (3 subplots) and 3D trajectory from solved records."""
+    if not records or "ee_pos" not in records[0]:
+        print("No EE position data to plot.")
+        return
+
+    t = np.array([r["t"] for r in records], dtype=float)
+    pos = np.array([r["ee_pos"] for r in records], dtype=float)
+
+    # Transform into initial EE frame
+    R0 = np.array(records[0]["ee_rot"], dtype=float)
+    t0 = pos[0].copy()
+    pos_ee = np.array([R0.T @ (p - t0) for p in pos]) * 1000.0  # m → mm
+
+    # 3-subplot: X, Y, Z vs time in initial EE frame
+    labels = ("X", "Y", "Z")
+    colors = ("tab:red", "tab:green", "tab:blue")
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    for idx, ax in enumerate(axes):
+        ax.plot(t, pos_ee[:, idx], color=colors[idx], linewidth=1.2, label=f"EE {labels[idx]}")
+        ax.set_ylabel(f"{labels[idx]} (mm)")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+        ax.legend(loc="upper right")
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle("EE Position (initial EE frame)")
+    plt.tight_layout()
+    plt.show()
+
+    # 3D plot
+    fig3d = plt.figure(figsize=(10, 8))
+    ax3d = fig3d.add_subplot(111, projection="3d")
+    ax3d.plot(pos_ee[:, 0], pos_ee[:, 1], pos_ee[:, 2], "b-", linewidth=1.2, label="EE path")
+    ax3d.scatter(*pos_ee[0], c="green", s=80, marker="o", label="Start")
+    ax3d.scatter(*pos_ee[-1], c="red", s=80, marker="x", label="End")
+    ax3d.set_xlabel("X (mm)")
+    ax3d.set_ylabel("Y (mm)")
+    ax3d.set_zlabel("Z (mm)")
+    ax3d.set_title("EE Trajectory (initial EE frame)")
+    ax3d.legend()
+    plt.tight_layout()
+    plt.show()
+
+
 def print_joint_trajectory_debug(records, q_init, n=5):
     """Print raw solved joint samples and initial-step deltas for debugging."""
     if not records:
@@ -291,6 +334,12 @@ if __name__ == "__main__":
             joint1=0.0, joint2=2.69, joint3=0.0, joint4=-1.87,
             joint5=0.0, joint6=0.69, joint7=0.0,
         )
+        
+        # q_ref = custom_configuration_vector(
+        #     robot,
+        #     joint1=-0.67, joint2=2.48, joint3=0.0, joint4=-2.08,
+        #     joint5=-0.54, joint6=1.1, joint7=0.31,
+        # )
     else:  # "b"
         q_ref = custom_configuration_vector(
             robot,
@@ -444,11 +493,14 @@ if __name__ == "__main__":
         if RUN_MODE == "once" and float(t_elapsed) >= float(WARMUP_SKIP_SEC):
             if sim_time_offset is None:
                 sim_time_offset = sim_time
+            ee_tf = configuration.get_transform_frame_to_world(EE_NAME)
             solved_joint_records.append(
                 {
                     "t": float(sim_time - sim_time_offset),
                     "sample_idx": len(solved_joint_records),
                     "q": configuration.q.copy(),
+                    "ee_pos": ee_tf.translation.copy(),
+                    "ee_rot": ee_tf.rotation.copy(),
                 }
             )
 
@@ -473,6 +525,7 @@ if __name__ == "__main__":
         save_trj(trj_path, solved_joint_records, target_hz=TRJ_HZ)
         if PLOT_SAVED_JOINT_TRAJ:
             plot_joint_trajectory(solved_joint_records)
+            plot_ee_trajectory(solved_joint_records)
 
 
         

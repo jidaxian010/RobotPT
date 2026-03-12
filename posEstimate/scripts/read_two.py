@@ -28,6 +28,7 @@ from pathlib import Path
 import yaml
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 import mediapipe as mpipe
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
@@ -46,9 +47,9 @@ RunningMode           = mpipe.tasks.vision.RunningMode
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME   = "P3-B2"
+DATA_NAME   = "P3-A3"
 GRIPPER_CAM = "right"       # "left" or "right": which camera provides ArUco 3D tracking
-CROP        = (11, 21)       # (start, end); negative values = seconds from end of stream
+CROP        = (15, 21)       # (start, end); negative values = seconds from end of stream
 # CROP      = None          # None = no extra crop (process everything in the extracted video)
 CROP_UNIT   = "s"           # "s" (seconds) or "frame"
 
@@ -774,6 +775,87 @@ def average_trajectory(sparse_csv_path, fps, out_dir, data_name, video_path=None
 
 
 # ==========================================
+# --- TRAJECTORY VISUALIZATION ---
+# ==========================================
+
+def _extract_cam_frame_trajectory(gripper_poses, timestamps):
+    """Extract position (mm) and time arrays from gripper_poses list (camera frame)."""
+    t_list, pos_list = [], []
+    t0 = None
+    for i, p in enumerate(gripper_poses):
+        if p is None:
+            continue
+        if t0 is None:
+            t0 = float(timestamps[i])
+        t_list.append(float(timestamps[i]) - t0)
+        pos_list.append(p["position"].copy())  # already in mm, camera frame
+    return np.array(t_list), np.array(pos_list)
+
+
+def plot_3d_trajectory(gripper_poses, timestamps):
+    """3D plot of gripper trajectory in camera frame with camera origin."""
+    t, pos = _extract_cam_frame_trajectory(gripper_poses, timestamps)
+    if len(pos) < 2:
+        print("  Not enough poses for 3D plot.")
+        return
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", linewidth=1.2, label="Trajectory")
+    ax.scatter(*pos[0], c="green", s=80, marker="o", label="Start")
+    ax.scatter(*pos[-1], c="red", s=80, marker="x", label="End")
+
+    # Draw camera at origin
+    ax.scatter(0, 0, 0, c="black", s=120, marker="^", label="Camera")
+    cam_len = 30.0  # mm
+    ax.quiver(0, 0, 0, cam_len, 0, 0, color="r", arrow_length_ratio=0.15)
+    ax.quiver(0, 0, 0, 0, cam_len, 0, color="g", arrow_length_ratio=0.15)
+    ax.quiver(0, 0, 0, 0, 0, cam_len, color="b", arrow_length_ratio=0.15)
+
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.set_zlabel("Z (mm)")
+    ax.set_title(f"{DATA_NAME} — Gripper trajectory (camera frame)")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_xyz_vs_time(gripper_poses, timestamps):
+    """3-subplot figure: X, Y, Z position vs time in initial gripper frame."""
+    t, pos = _extract_cam_frame_trajectory(gripper_poses, timestamps)
+    if len(pos) < 2:
+        print("  Not enough poses for XYZ plot.")
+        return
+
+    # Transform into initial gripper frame (R0, t0)
+    # Find the first valid pose for R0
+    R0 = None
+    for p in gripper_poses:
+        if p is not None:
+            R0 = p["rotation"]
+            break
+    t0 = pos[0]
+    pos_gripper = np.array([R0.T @ (p - t0) for p in pos])
+
+    labels = ("X", "Y", "Z")
+    colors = ("tab:red", "tab:green", "tab:blue")
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    for idx, ax in enumerate(axes):
+        ax.plot(t, pos_gripper[:, idx], color=colors[idx], linewidth=1.2, label=f"{labels[idx]}")
+        ax.set_ylabel(f"{labels[idx]} (mm)")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+        ax.legend(loc="upper right")
+
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(f"{DATA_NAME} — Gripper position (initial gripper frame)")
+    plt.tight_layout()
+    plt.show()
+
+
+# ==========================================
 # --- MAIN PROCESSOR ---
 # ==========================================
 
@@ -848,6 +930,10 @@ class TwoCamProcessor:
 
         gripper_poses_raw = self._build_gripper_poses(per_frame_dets_all)
         gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
+
+        # ── Visualize gripper trajectory in camera frame ────────────────
+        plot_3d_trajectory(gripper_poses, gcam_ts)
+        plot_xyz_vs_time(gripper_poses, gcam_ts)
 
         sparse_csv = self._save_csv(gripper_poses, gcam_ts)
 

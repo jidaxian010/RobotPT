@@ -16,8 +16,11 @@ from rosbag_reader import AnyReader, typestore
 TOPIC_NAME = "/rokubi/wrench"
 DEFAULT_DATA_NAME = "P3-A3"
 ONBOARD_NAME = "WearableData-03-08-26-16-27-33"
-DEFAULT_BAG_PATH = Path(f"posEstimate/data/P3-A3/{ONBOARD_NAME}")
-OUT_DIR = Path("posEstimate/data/P3-A3")
+DEFAULT_BAG_PATH = Path(f"posEstimate/data/{DEFAULT_DATA_NAME}/{ONBOARD_NAME}")
+OUT_DIR = Path(f"posEstimate/data/{DEFAULT_DATA_NAME}")
+
+# Calibration offsets (subtract from raw readings to zero the sensor)
+FORCE_OFFSET = np.array([13.6956, 71.2358, -18.4729])
 
 
 def get_stamp(msg, fallback_ns):
@@ -55,6 +58,12 @@ def read_wrench_force(bag_path, topic_name=TOPIC_NAME):
 
     data = np.asarray(samples, dtype=np.float64)
     data[:, 0] -= data[0, 0]
+    data[:, 1:] -= FORCE_OFFSET
+    # Sensor frame → gripper frame: +y_raw → -x_gripper, +x_raw → +y_gripper
+    fx_raw = data[:, 1].copy()
+    fy_raw = data[:, 2].copy()
+    data[:, 1] = -fy_raw
+    data[:, 2] = fx_raw
     return data
 
 
@@ -165,11 +174,8 @@ def save_force_rule_book(clean_data, bag_path, topic_name=TOPIC_NAME):
     axis_rules = {}
     for axis_name, values in force_axes.items():
         axis_rules[axis_name] = {
-            "n_samples": int(len(values)),
-            "min_N": round(float(np.min(values)), 2),
-            "max_N": round(float(np.max(values)), 2),
-            "mean_N": round(float(np.mean(values)), 2),
-            "std_N": round(float(np.std(values)), 2),
+            "min_N": round(float(np.nanmin(values)), 2),
+            "max_N": round(float(np.nanmax(values)), 2),
         }
 
     bag_name = Path(bag_path).name
