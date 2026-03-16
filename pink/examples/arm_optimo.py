@@ -329,17 +329,17 @@ if __name__ == "__main__":
 
 
     if MOTION == "a":
-        q_ref = custom_configuration_vector(
-            robot,
-            joint1=0.0, joint2=2.69, joint3=0.0, joint4=-1.87,
-            joint5=0.0, joint6=0.69, joint7=0.0,
-        )
-        
         # q_ref = custom_configuration_vector(
         #     robot,
-        #     joint1=-0.67, joint2=2.48, joint3=0.0, joint4=-2.08,
-        #     joint5=-0.54, joint6=1.1, joint7=0.31,
+        #     joint1=0.0, joint2=2.69, joint3=0.0, joint4=-1.87,
+        #     joint5=0.0, joint6=0.69, joint7=0.0,
         # )
+        
+        q_ref = custom_configuration_vector(
+            robot,
+            joint1=-0.67, joint2=2.48, joint3=0.0, joint4=-2.08,
+            joint5=-0.54, joint6=1.1, joint7=0.31,
+        )
     else:  # "b"
         q_ref = custom_configuration_vector(
             robot,

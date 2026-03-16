@@ -70,7 +70,7 @@ RIGHT_DEPTH_TOPIC = "/right_camera/camera/camera/aligned_depth_to_color/image_ra
 
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL   = 15   # must be odd
-SMOOTH_SIGMA        = 20
+SMOOTH_SIGMA        = 10
 
 MARKER_SIZE_METERS = 0.0725
 
@@ -91,10 +91,24 @@ _TRIPLET_DESCRIPTIONS = {
 MODEL_PATH = str(Path(__file__).resolve().parent.parent /
                  "data" / "pose_landmarker_full.task")
 
-_FX = 602.6597900390625
+# Cam: 335222070270
+_FX = 602.6598510742188
 _FY = 602.2169799804688
-_CX = 423.1910400390625
+_CX = 319.1910400390625
 _CY = 249.92578125
+
+# # ?
+# _FX = 602.6597900390625
+# _FY = 602.2169799804688
+# _CX = 423.1910400390625
+# _CY = 249.92578125
+
+# # Cam: 018322070277
+# _FX = 914.2034301757812
+# _FY = 914.743896484375
+# _CX = 646.1510620117188
+# _CY = 363.29620361328125
+
 
 CAMERA_MATRIX = np.array(
     [[_FX, 0.0, _CX], [0.0, _FY, _CY], [0.0, 0.0, 1.0]], dtype=np.float32
@@ -792,7 +806,7 @@ def _extract_cam_frame_trajectory(gripper_poses, timestamps):
     return np.array(t_list), np.array(pos_list)
 
 
-def plot_3d_trajectory(gripper_poses, timestamps):
+def plot_3d_trajectory(gripper_poses, timestamps, gripper_poses_raw=None):
     """3D plot of gripper trajectory in camera frame with camera origin."""
     t, pos = _extract_cam_frame_trajectory(gripper_poses, timestamps)
     if len(pos) < 2:
@@ -802,7 +816,16 @@ def plot_3d_trajectory(gripper_poses, timestamps):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", linewidth=1.2, label="Trajectory")
+    # If raw poses provided and different from main, show both
+    if gripper_poses_raw is not None and gripper_poses_raw is not gripper_poses:
+        t_raw, pos_raw = _extract_cam_frame_trajectory(gripper_poses_raw, timestamps)
+        if len(pos_raw) >= 2:
+            ax.plot(pos_raw[:, 0], pos_raw[:, 1], pos_raw[:, 2],
+                    color="gray", linewidth=0.6, alpha=0.5, label="Raw")
+        ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", linewidth=1.2, label="Smoothed")
+    else:
+        ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "b-", linewidth=1.2, label="Trajectory")
+
     ax.scatter(*pos[0], c="green", s=80, marker="o", label="Start")
     ax.scatter(*pos[-1], c="red", s=80, marker="x", label="End")
 
@@ -822,7 +845,7 @@ def plot_3d_trajectory(gripper_poses, timestamps):
     plt.show()
 
 
-def plot_xyz_vs_time(gripper_poses, timestamps):
+def plot_xyz_vs_time(gripper_poses, timestamps, gripper_poses_raw=None):
     """3-subplot figure: X, Y, Z position vs time in initial gripper frame."""
     t, pos = _extract_cam_frame_trajectory(gripper_poses, timestamps)
     if len(pos) < 2:
@@ -830,7 +853,6 @@ def plot_xyz_vs_time(gripper_poses, timestamps):
         return
 
     # Transform into initial gripper frame (R0, t0)
-    # Find the first valid pose for R0
     R0 = None
     for p in gripper_poses:
         if p is not None:
@@ -839,12 +861,29 @@ def plot_xyz_vs_time(gripper_poses, timestamps):
     t0 = pos[0]
     pos_gripper = np.array([R0.T @ (p - t0) for p in pos])
 
+    # Raw poses (if smoothing is on, overlay raw underneath)
+    has_raw = (gripper_poses_raw is not None
+               and gripper_poses_raw is not gripper_poses)
+    if has_raw:
+        t_raw, pos_raw_cam = _extract_cam_frame_trajectory(gripper_poses_raw, timestamps)
+        if len(pos_raw_cam) >= 2:
+            pos_raw_gripper = np.array([R0.T @ (p - t0) for p in pos_raw_cam])
+        else:
+            has_raw = False
+
     labels = ("X", "Y", "Z")
     colors = ("tab:red", "tab:green", "tab:blue")
 
     fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
     for idx, ax in enumerate(axes):
-        ax.plot(t, pos_gripper[:, idx], color=colors[idx], linewidth=1.2, label=f"{labels[idx]}")
+        if has_raw:
+            ax.plot(t_raw, pos_raw_gripper[:, idx], color="gray", linewidth=0.6,
+                    alpha=0.5, label=f"{labels[idx]} raw")
+            ax.plot(t, pos_gripper[:, idx], color=colors[idx], linewidth=1.2,
+                    label=f"{labels[idx]} smoothed")
+        else:
+            ax.plot(t, pos_gripper[:, idx], color=colors[idx], linewidth=1.2,
+                    label=f"{labels[idx]}")
         ax.set_ylabel(f"{labels[idx]} (mm)")
         ax.grid(True, linewidth=0.4, alpha=0.5)
         ax.legend(loc="upper right")
@@ -853,6 +892,256 @@ def plot_xyz_vs_time(gripper_poses, timestamps):
     fig.suptitle(f"{DATA_NAME} — Gripper position (initial gripper frame)")
     plt.tight_layout()
     plt.show()
+
+
+def plot_per_marker_pose(per_frame_dets, timestamps):
+    """Plot each ArUco marker's position (relative to its own first detection) vs time.
+    3 subplots (X, Y, Z), each with one line per marker ID."""
+    # Collect per-marker trajectories
+    marker_data = {}  # tag_id -> (times, positions_mm)
+    t0 = None
+    for i, dets in enumerate(per_frame_dets):
+        for det in dets:
+            if "t_ij_mm" not in det:
+                continue
+            tid = det["tag_id"]
+            if t0 is None:
+                t0 = float(timestamps[0])
+            if tid not in marker_data:
+                marker_data[tid] = {"t": [], "pos": [], "pos0": det["t_ij_mm"].copy()}
+            marker_data[tid]["t"].append(float(timestamps[i]) - t0)
+            marker_data[tid]["pos"].append(det["t_ij_mm"] - marker_data[tid]["pos0"])
+
+    if not marker_data:
+        print("  No marker data for per-marker plot.")
+        return
+
+    labels = ("X", "Y", "Z")
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{DATA_NAME} — Per-marker position (relative to own start)")
+    for ax_idx, ax in enumerate(axes):
+        for tid in sorted(marker_data.keys()):
+            t_arr = np.array(marker_data[tid]["t"])
+            pos_arr = np.array(marker_data[tid]["pos"])
+            ax.plot(t_arr, pos_arr[:, ax_idx], linewidth=0.8,
+                    label=f"Tag {tid}", alpha=0.8)
+        ax.set_ylabel(f"{labels[ax_idx]} (mm)")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Time (s)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_per_marker_gripper(per_frame_dets, timestamps, gripper_poses):
+    """Plot gripper position estimated by each marker independently.
+    Transforms each marker's T_ik into the initial gripper frame.
+    3 subplots (X, Y, Z), one line per marker ID."""
+    # Find initial gripper frame (R0, t0) from first valid fused pose
+    R0, t0_pos = None, None
+    for p in gripper_poses:
+        if p is not None:
+            R0 = p["rotation"]
+            t0_pos = p["position"]
+            break
+    if R0 is None:
+        print("  No valid gripper pose for per-marker gripper plot.")
+        return
+
+    # Collect per-marker gripper estimates
+    marker_data = {}  # tag_id -> (times, gripper_pos_in_initial_frame)
+    t0 = float(timestamps[0])
+    for i, dets in enumerate(per_frame_dets):
+        for det in dets:
+            if "T_ik" not in det:
+                continue
+            tid = det["tag_id"]
+            gripper_mm = det["T_ik"][0:3, 3] * 1000.0
+            pos_rel = R0.T @ (gripper_mm - t0_pos)
+            if tid not in marker_data:
+                marker_data[tid] = {"t": [], "pos": []}
+            marker_data[tid]["t"].append(float(timestamps[i]) - t0)
+            marker_data[tid]["pos"].append(pos_rel)
+
+    if not marker_data:
+        print("  No marker data for per-marker gripper plot.")
+        return
+
+    labels = ("X", "Y", "Z")
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"{DATA_NAME} — Gripper estimate by each marker (initial gripper frame)")
+    for ax_idx, ax in enumerate(axes):
+        for tid in sorted(marker_data.keys()):
+            t_arr = np.array(marker_data[tid]["t"])
+            pos_arr = np.array(marker_data[tid]["pos"])
+            ax.plot(t_arr, pos_arr[:, ax_idx], linewidth=0.8,
+                    label=f"Tag {tid}", alpha=0.8)
+        ax.set_ylabel(f"{labels[ax_idx]} (mm)")
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Time (s)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_debug_marker3(per_frame_dets, timestamps):
+    """Decompose marker 3's gripper estimate to find the Z-drift source.
+
+    Gripper position = R_ij @ t_tag + t_ij
+      - t_ij:          marker translation in camera frame (from depth or PnP)
+      - R_ij @ t_tag:  rotation-amplified offset from marker to gripper
+
+    Plots:
+      Row 1: raw inputs — u (px), v (px), depth (mm)
+      Row 2: marker translation t_ij (mm, relative)
+      Row 3: PnP tvec_rgb (mm, relative) — for comparison with depth-based t_ij
+      Row 4: R_ij euler angles (deg)
+      Row 5: R_ij @ t_tag (mm, relative)
+      Row 6: final gripper T_ik (mm, relative)
+    """
+    TAG_ID = 3
+    t_tag = TAG_TRANSFORMS[TAG_ID][0:3, 3:4]  # (3,1) in meters
+
+    times = []
+    u_list, v_list, depth_list = [], [], []
+    t_ij_list, tvec_pnp_list = [], []
+    euler_list, rot_contrib_list, gripper_list = [], [], []
+    t0 = float(timestamps[0])
+    first = True
+    t_ij_0, tvec_pnp_0, rot_contrib_0, gripper_0 = None, None, None, None
+
+    for i, dets in enumerate(per_frame_dets):
+        for det in dets:
+            if det["tag_id"] != TAG_ID or "T_ik" not in det:
+                continue
+
+            R_ij = det["R_ij"]
+            t_ik = det["T_ik"][0:3, 3:4]           # (3,1) meters
+            rot_contrib = R_ij @ t_tag               # (3,1) meters
+            t_ij = t_ik - rot_contrib                # (3,1) meters
+
+            t_ij_mm = t_ij.flatten() * 1000.0
+            tvec_pnp_mm = np.asarray(det["tvec_rgb"], dtype=np.float64).flatten() * 1000.0
+            rot_contrib_mm = rot_contrib.flatten() * 1000.0
+            gripper_mm = t_ik.flatten() * 1000.0
+            euler = ScipyRotation.from_matrix(R_ij).as_euler("xyz", degrees=True)
+
+            cx, cy = det["center"]
+            depth_mm = det["depth_m"] * 1000.0
+
+            if first:
+                t_ij_0 = t_ij_mm.copy()
+                tvec_pnp_0 = tvec_pnp_mm.copy()
+                rot_contrib_0 = rot_contrib_mm.copy()
+                gripper_0 = gripper_mm.copy()
+                first = False
+
+            times.append(float(timestamps[i]) - t0)
+            u_list.append(cx)
+            v_list.append(cy)
+            depth_list.append(depth_mm)
+            t_ij_list.append(t_ij_mm - t_ij_0)
+            tvec_pnp_list.append(tvec_pnp_mm - tvec_pnp_0)
+            euler_list.append(euler)
+            rot_contrib_list.append(rot_contrib_mm - rot_contrib_0)
+            gripper_list.append(gripper_mm - gripper_0)
+
+    if not times:
+        print("  No marker 3 detections for debug plot.")
+        return
+
+    times = np.array(times)
+    u_arr = np.array(u_list)
+    v_arr = np.array(v_list)
+    depth_arr = np.array(depth_list)
+    t_ij_arr = np.array(t_ij_list)
+    tvec_pnp_arr = np.array(tvec_pnp_list)
+    euler_arr = np.array(euler_list)
+    rot_arr = np.array(rot_contrib_list)
+    grip_arr = np.array(gripper_list)
+
+    fig, axes = plt.subplots(6, 3, figsize=(16, 18), sharex=True)
+    fig.suptitle(f"{DATA_NAME} — Marker 3 full debug", fontsize=13)
+
+    # Row 0: raw inputs (u, v, depth)
+    axes[0][0].plot(times, u_arr, linewidth=0.8, color="purple")
+    axes[0][0].set_ylabel("Raw inputs", fontsize=8)
+    axes[0][0].set_title("u (px)")
+    axes[0][1].plot(times, v_arr, linewidth=0.8, color="purple")
+    axes[0][1].set_title("v (px)")
+    axes[0][2].plot(times, depth_arr, linewidth=0.8, color="purple")
+    axes[0][2].set_title("depth (mm)")
+
+    # Rows 1-5: decomposition
+    row_titles = [
+        "t_ij depth-based (mm, rel)",
+        "tvec PnP (mm, rel)",
+        "R_ij Euler (deg)",
+        "R_ij @ t_tag (mm, rel)",
+        "Gripper T_ik (mm, rel)",
+    ]
+    data_rows = [t_ij_arr, tvec_pnp_arr, euler_arr, rot_arr, grip_arr]
+    axis_labels = ("X", "Y", "Z")
+
+    for row_i, (title, data) in enumerate(zip(row_titles, data_rows), start=1):
+        for col in range(3):
+            ax = axes[row_i][col]
+            ax.plot(times, data[:, col], linewidth=0.8)
+            ax.grid(True, linewidth=0.4, alpha=0.5)
+            if col == 0:
+                ax.set_ylabel(title, fontsize=8)
+            ax.set_title(f"{axis_labels[col]}", fontsize=9)
+
+    for ax in axes[0]:
+        ax.grid(True, linewidth=0.4, alpha=0.5)
+    for col in range(3):
+        axes[-1][col].set_xlabel("Time (s)")
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print summary
+    print(f"\n  Marker 3 debug summary:")
+    print(f"  {'Raw input':<20} {'min':>10} {'max':>10} {'range':>10}")
+    print(f"  {'-'*52}")
+    print(f"  {'u (px)':<20} {u_arr.min():>10.1f} {u_arr.max():>10.1f} {u_arr.max()-u_arr.min():>10.1f}")
+    print(f"  {'v (px)':<20} {v_arr.min():>10.1f} {v_arr.max():>10.1f} {v_arr.max()-v_arr.min():>10.1f}")
+    print(f"  {'depth (mm)':<20} {depth_arr.min():>10.1f} {depth_arr.max():>10.1f} {depth_arr.max()-depth_arr.min():>10.1f}")
+    n_no_depth = np.sum(depth_arr == 0)
+    print(f"  Frames with no depth: {n_no_depth}/{len(depth_arr)}")
+    print()
+    print(f"  {'Component':<30} {'X range':>10} {'Y range':>10} {'Z range':>10} mm")
+    print(f"  {'-'*62}")
+    for name, arr in [("t_ij (depth-based)", t_ij_arr),
+                       ("tvec PnP", tvec_pnp_arr),
+                       ("R_ij @ t_tag (rot contrib)", rot_arr),
+                       ("T_ik (gripper total)", grip_arr)]:
+        ranges = arr.max(axis=0) - arr.min(axis=0)
+        print(f"  {name:<30} {ranges[0]:>10.1f} {ranges[1]:>10.1f} {ranges[2]:>10.1f}")
+
+    # Save debug data to CSV
+    debug_csv_path = OUT_DIR / f"{DATA_NAME}_marker3_debug.csv"
+    with open(debug_csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "t", "u_px", "v_px", "depth_mm",
+            "t_ij_x", "t_ij_y", "t_ij_z",
+            "tvec_pnp_x", "tvec_pnp_y", "tvec_pnp_z",
+            "euler_x_deg", "euler_y_deg", "euler_z_deg",
+            "rot_contrib_x", "rot_contrib_y", "rot_contrib_z",
+            "gripper_x", "gripper_y", "gripper_z",
+        ])
+        for i in range(len(times)):
+            w.writerow([
+                round(float(times[i]), 6),
+                int(u_arr[i]), int(v_arr[i]), round(float(depth_arr[i]), 1),
+                round(float(t_ij_arr[i, 0]), 3), round(float(t_ij_arr[i, 1]), 3), round(float(t_ij_arr[i, 2]), 3),
+                round(float(tvec_pnp_arr[i, 0]), 3), round(float(tvec_pnp_arr[i, 1]), 3), round(float(tvec_pnp_arr[i, 2]), 3),
+                round(float(euler_arr[i, 0]), 4), round(float(euler_arr[i, 1]), 4), round(float(euler_arr[i, 2]), 4),
+                round(float(rot_arr[i, 0]), 3), round(float(rot_arr[i, 1]), 3), round(float(rot_arr[i, 2]), 3),
+                round(float(grip_arr[i, 0]), 3), round(float(grip_arr[i, 1]), 3), round(float(grip_arr[i, 2]), 3),
+            ])
+    print(f"  Saved debug CSV: {debug_csv_path}")
 
 
 # ==========================================
@@ -901,6 +1190,7 @@ class TwoCamProcessor:
         aruco_params.cornerRefinementMaxIterations = 50
         aruco_params.cornerRefinementMinAccuracy = 0.01
         self._aruco_det = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+        self._prev_rvec = {}  # tag_id -> (rvec, tvec) for PnP temporal consistency
 
     # ------------------------------------------------------------------
     # Orchestrator
@@ -932,8 +1222,13 @@ class TwoCamProcessor:
         gripper_poses     = self._smooth_gripper_poses(gripper_poses_raw)
 
         # ── Visualize gripper trajectory in camera frame ────────────────
-        plot_3d_trajectory(gripper_poses, gcam_ts)
-        plot_xyz_vs_time(gripper_poses, gcam_ts)
+        plot_3d_trajectory(gripper_poses, gcam_ts, gripper_poses_raw)
+        plot_xyz_vs_time(gripper_poses, gcam_ts, gripper_poses_raw)
+
+        # ── Per-marker diagnostic plots ───────────────────────────────
+        plot_per_marker_pose(per_frame_dets_all, gcam_ts)
+        plot_per_marker_gripper(per_frame_dets_all, gcam_ts, gripper_poses)
+        plot_debug_marker3(per_frame_dets_all, gcam_ts)
 
         sparse_csv = self._save_csv(gripper_poses, gcam_ts)
 
@@ -1064,15 +1359,42 @@ class TwoCamProcessor:
 
         for i in range(len(ids)):
             tag_id = int(ids[i][0])
-            if tag_id not in TAG_TRANSFORMS:
+            if tag_id not in TAG_TRANSFORMS or tag_id != 3:
                 continue
             marker_2d = corners[i][0].astype(np.float32)
-            ok, rvec, tvec_rgb = cv2.solvePnP(
-                marker_3d_edges, marker_2d, CAMERA_MATRIX, DIST_COEFFS
-            )
+
+            # Use previous frame's solution as initial guess for stability
+            prev = self._prev_rvec.get(tag_id)
+            if prev is not None:
+                ok, rvec, tvec_rgb = cv2.solvePnP(
+                    marker_3d_edges, marker_2d, CAMERA_MATRIX, DIST_COEFFS,
+                    rvec=prev[0].copy(), tvec=prev[1].copy(),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            else:
+                ok, rvec, tvec_rgb = cv2.solvePnP(
+                    marker_3d_edges, marker_2d, CAMERA_MATRIX, DIST_COEFFS
+                )
             if not ok:
                 continue
+
+            # Reject rotation flips: if rvec suddenly jumps too far from
+            # previous frame, keep the previous rvec instead
             R_ij, _ = cv2.Rodrigues(rvec)
+            if prev is not None:
+                R_prev, _ = cv2.Rodrigues(prev[0])
+                # Angle between current and previous rotation
+                R_diff = R_prev.T @ R_ij
+                angle_diff = abs(np.arccos(np.clip(
+                    (np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0
+                )))
+                if np.degrees(angle_diff) > 30.0:  # max 30°/frame
+                    rvec = prev[0].copy()
+                    tvec_rgb = prev[1].copy()
+                    R_ij, _ = cv2.Rodrigues(rvec)
+
+            self._prev_rvec[tag_id] = (rvec.copy(), tvec_rgb.copy())
             cx = int(np.mean(marker_2d[:, 0]))
             cy = int(np.mean(marker_2d[:, 1]))
             depth_m = 0.0
@@ -1112,6 +1434,7 @@ class TwoCamProcessor:
                 T_ij = build_T(t_ij, det["R_ij"])
                 T_ik = T_ij @ TAG_TRANSFORMS[det["tag_id"]]
                 det["T_ik"] = T_ik
+                det["t_ij_mm"] = t_ij.flatten() * 1000.0  # marker pos in cam frame (mm)
                 k_pos.append(T_ik[0:3, 3:4])
                 k_rot.append(T_ik[0:3, 0:3])
             if k_pos:

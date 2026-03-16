@@ -20,7 +20,7 @@ from rosbag_reader import AnyReader, typestore
 # --- USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME  = "P3-B2"
+DATA_NAME  = "P3-A3"
 BAG_PATH   = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 OUT_BASE   = Path("posEstimate/data")
 
