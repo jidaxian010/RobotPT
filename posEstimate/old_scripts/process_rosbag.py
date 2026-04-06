@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rosbag_reader import AnyReader, typestore
 from denoise import denoise_pose_list
 from joint_tracker import PoseTracker
-from human_pose import _draw_pose, _draw_vis_legend
+from posEstimate.old_scripts.human_pose import _draw_pose, _draw_vis_legend
 
 # MediaPipe aliases
 BaseOptions           = mpipe.tasks.BaseOptions
@@ -971,7 +971,7 @@ class RosbagProcessor:
             print(f"  Force: onboard bag not found: {ONBOARD_BAG_PATH}")
             return None
         print(f"  Reading force from {ONBOARD_BAG_PATH} ...")
-        from read_onboard import read_wrench_force
+        from posEstimate.old_scripts.read_onboard import read_wrench_force
         force_data = read_wrench_force(ONBOARD_BAG_PATH, topic_name=FORCE_TOPIC)
         print(f"  Force: {len(force_data)} samples, "
               f"duration={force_data[-1, 0]:.1f}s")

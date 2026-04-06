@@ -37,7 +37,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-DATA_NAME  = "jeff"  # for default CSV path; edit one value here
+DATA_NAME  = "mb"  # for default CSV path; edit one value here
 MOTION   = "a"     # "a" or "b": initial arm configuration
 RUN_MODE = "loop"  # "loop" or "once"
 TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
@@ -64,8 +64,8 @@ R_SIDE_TO_DEFAULT = np.array([
 ])
 
 R_GRIPPER_TO_EE = np.array([
-    [0.0, 1.0, 0.0],
-    [-1.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [1.0, 0.0, 0.0],
     [0.0, 0.0, 1.0],
 ])
 
@@ -352,8 +352,8 @@ if __name__ == "__main__":
         # )
         q_ref = custom_configuration_vector(
             robot,
-            joint1=d2r(4.37), joint2=d2r(183.80), joint3=d2r(-5.36), joint4=d2r(-95.95),
-            joint5=d2r(1.76), joint6=d2r(-86.76), joint7=d2r(93.77),
+            joint1=d2r(1.0), joint2=d2r(186.3), joint3=d2r(29.3), joint4=d2r(-113.7),
+            joint5=d2r(0.3), joint6=d2r(-69.8), joint7=d2r(-61.6),
         )
     else:  # "b"
         q_ref = custom_configuration_vector(

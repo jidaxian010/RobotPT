@@ -16,12 +16,12 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from rosbag_reader import AnyReader, typestore
+from util.rosbag_reader import AnyReader, typestore
 
 # ── config ────────────────────────────────────────────────────────────────────
-DATA_NAME = "jeff"
+DATA_NAME = "mb"
 DATA_DIR  = Path(__file__).resolve().parents[1] / "data"
-BAG_PATH  = DATA_DIR / DATA_NAME
+BAG_PATH  = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 IMAGE_TOPIC = "/aruco/gripper_pose_four"
 
 

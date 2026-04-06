@@ -17,25 +17,25 @@ from scipy.spatial.transform import Rotation as ScipyRotation
 # Allow imports from posEstimate/ regardless of working directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rosbag_reader import AnyReader, typestore
-from gripper_visualize import (
+from util.rosbag_reader import AnyReader, typestore
+from util.gripper_visualize import (
     plot_gripper_camera_frame,
     plot_gripper_body_frame,
 )
-from denoise import denoise_pose_list
+from util.denoise import denoise_pose_list
 
 # ==========================================
 # --- 1. USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME = "jeff"
+DATA_NAME = "mb"
 DATA_DIR  = Path(__file__).resolve().parents[1] / "data"
-BAG_PATH  = DATA_DIR / DATA_NAME
+BAG_PATH  = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 
 GRIPPER_POSE_TOPIC = "/aruco/gripper_pose_four_pose"  # PoseStamped, in camera frame, mm + rot matrix
 
-CROP_START_S = 11.9  # seconds from bag start, or None to keep from beginning
-CROP_END_S   = 17.6  # seconds from bag start, or None to keep to end
+CROP_START_S = 20  # seconds from bag start, or None to keep from beginning
+CROP_END_S   = 24  # seconds from bag start, or None to keep to end
 
 SHOW_IMAGE = True
 SMOOTH_GRIPPER_POSE = True

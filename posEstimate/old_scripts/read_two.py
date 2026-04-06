@@ -255,7 +255,7 @@ def _gcam_worker(rgb_path, ts_arr, crop_sf, crop_ef,
     import numpy as np
     import mediapipe as mpipe
     from joint_tracker import PoseTracker
-    from human_pose import _draw_pose, _draw_vis_legend
+    from posEstimate.old_scripts.human_pose import _draw_pose, _draw_vis_legend
 
     BaseOptions           = mpipe.tasks.BaseOptions
     PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
@@ -349,7 +349,7 @@ def _other_worker(rgb_path, ts_arr, crop_sf, crop_ef,
     import numpy as np
     import mediapipe as mpipe
     from joint_tracker import PoseTracker
-    from human_pose import _draw_pose, _draw_vis_legend
+    from posEstimate.old_scripts.human_pose import _draw_pose, _draw_vis_legend
 
     BaseOptions           = mpipe.tasks.BaseOptions
     PoseLandmarker        = mpipe.tasks.vision.PoseLandmarker
