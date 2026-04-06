@@ -15,7 +15,7 @@ from pathlib import Path
 
 # Set this to use a named file without the -f flag (e.g. "easy" or "pose3")
 # Leave empty to require -f from the command line
-TRAJ_NAME = "pose4"
+TRAJ_NAME = "jeff"
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 JOINT_LABELS = ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]
@@ -128,7 +128,7 @@ def main():
     if args.file:
         path = Path(args.file)
     elif TRAJ_NAME:
-        path = DATA_DIR / f"{TRAJ_NAME}.trj"
+        path = DATA_DIR / TRAJ_NAME / f"{TRAJ_NAME}.trj"
     else:
         print("Error: provide -f <file> or set TRAJ_NAME at the top of this script.", file=sys.stderr)
         sys.exit(1)

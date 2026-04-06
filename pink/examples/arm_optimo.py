@@ -37,9 +37,9 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-DATA_NAME  = "P3-A3"  # for default CSV path; edit one value here
+DATA_NAME  = "jeff"  # for default CSV path; edit one value here
 MOTION   = "a"     # "a" or "b": initial arm configuration
-RUN_MODE = "once"  # "loop" or "once"
+RUN_MODE = "loop"  # "loop" or "once"
 TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 
 
@@ -57,11 +57,20 @@ REPARAMETRIZE = True  # arc-length reparametrization for uniform speed
 # gripper +y -> EE +x
 # gripper +x -> EE -y
 # gripper +z -> EE +z
+R_SIDE_TO_DEFAULT = np.array([
+    [-1.0,  0.0,  0.0],
+    [ 0.0,  0.0, -1.0],
+    [ 0.0, -1.0,  0.0],
+])
+
 R_GRIPPER_TO_EE = np.array([
     [0.0, 1.0, 0.0],
     [-1.0, 0.0, 0.0],
     [0.0, 0.0, 1.0],
 ])
+
+# Combined: side → default → EE
+R_COMBINED = R_GRIPPER_TO_EE @ R_SIDE_TO_DEFAULT
 
 # CSV produced by RosbagGripperPoseTracker.save_poses_csv()
 # Columns: t, frame, pos_x, pos_y, pos_z, orient_x, orient_y, orient_z
@@ -130,8 +139,8 @@ def read_poses(path):
                     float(row["orient_z"]),
                 ])
                 R_gripper = ScipyRotation.from_euler("xyz", euler).as_matrix()
-                pos_ee = R_GRIPPER_TO_EE @ pos_m
-                R_ee = R_GRIPPER_TO_EE @ R_gripper @ R_GRIPPER_TO_EE.T
+                pos_ee = R_COMBINED @ pos_m
+                R_ee = R_COMBINED @ R_gripper @ R_COMBINED.T
 
                 poses.append({
                     "t":        float(row["t"]),
@@ -328,23 +337,29 @@ if __name__ == "__main__":
     damping_task = DampingTask(cost=1e-3)
 
 
+    d2r = np.deg2rad
     if MOTION == "a":
         # q_ref = custom_configuration_vector(
         #     robot,
-        #     joint1=0.0, joint2=2.69, joint3=0.0, joint4=-1.87,
-        #     joint5=0.0, joint6=0.69, joint7=0.0,
+        #     joint1=d2r(0.0), joint2=d2r(154.13), joint3=d2r(0.0), joint4=d2r(-107.14),
+        #     joint5=d2r(0.0), joint6=d2r(39.53), joint7=d2r(0.0),
         # )
-        
+
+        # q_ref = custom_configuration_vector(
+        #     robot,
+        #     joint1=d2r(-38.38), joint2=d2r(142.08), joint3=d2r(0.0), joint4=d2r(-119.18),
+        #     joint5=d2r(-30.94), joint6=d2r(63.03), joint7=d2r(17.76),
+        # )
         q_ref = custom_configuration_vector(
             robot,
-            joint1=-0.67, joint2=2.48, joint3=0.0, joint4=-2.08,
-            joint5=-0.54, joint6=1.1, joint7=0.31,
+            joint1=d2r(4.37), joint2=d2r(183.80), joint3=d2r(-5.36), joint4=d2r(-95.95),
+            joint5=d2r(1.76), joint6=d2r(-86.76), joint7=d2r(93.77),
         )
     else:  # "b"
         q_ref = custom_configuration_vector(
             robot,
-            joint1=0.0, joint2=2.57, joint3=0.0, joint4=-1.62,
-            joint5=0.0, joint6=-0.38, joint7=0.0,
+            joint1=d2r(0.0), joint2=d2r(147.24), joint3=d2r(0.0), joint4=d2r(-92.84),
+            joint5=d2r(0.0), joint6=d2r(-21.77), joint7=d2r(0.0),
         )
     
     
