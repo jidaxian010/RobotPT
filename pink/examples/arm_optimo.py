@@ -37,9 +37,9 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-DATA_NAME  = "mb"  # for default CSV path; edit one value here
-MOTION   = "a"     # "a" or "b": initial arm configuration
-RUN_MODE = "loop"  # "loop" or "once"
+DATA_NAME  = "p9-c1-g"  # for default CSV path; edit one value here
+MOTION   = "b"     # "a" or "b": initial arm configuration
+RUN_MODE = "once"  # "loop" or "once"
 TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
 
 
@@ -352,15 +352,23 @@ if __name__ == "__main__":
         # )
         q_ref = custom_configuration_vector(
             robot,
-            joint1=d2r(1.0), joint2=d2r(186.3), joint3=d2r(29.3), joint4=d2r(-113.7),
-            joint5=d2r(0.3), joint6=d2r(-69.8), joint7=d2r(-61.6),
+            joint1=d2r(4.9), joint2=d2r(156.2), joint3=d2r(40.0), joint4=d2r(-107.2),
+            joint5=d2r(-19.3), joint6=d2r(-56.1), joint7=d2r(-35.2),
         )
     else:  # "b"
+        # q_ref = custom_configuration_vector(
+        #     robot,
+        #     joint1=d2r(63.4), joint2=d2r(132.3), joint3=d2r(25.7), joint4=d2r(-86.3),
+        #     joint5=d2r(66.8), joint6=d2r(-80.5), joint7=d2r(-35.6),
+        # )
+        
+        # "c"
         q_ref = custom_configuration_vector(
             robot,
-            joint1=d2r(0.0), joint2=d2r(147.24), joint3=d2r(0.0), joint4=d2r(-92.84),
-            joint5=d2r(0.0), joint6=d2r(-21.77), joint7=d2r(0.0),
+            joint1=d2r(67.2), joint2=d2r(132.3), joint3=d2r(25.7), joint4=d2r(-86.3),
+            joint5=d2r(30.5), joint6=d2r(-65.0), joint7=d2r(-25.0),
         )
+    
     
     
     solver = qpsolvers.available_solvers[0]

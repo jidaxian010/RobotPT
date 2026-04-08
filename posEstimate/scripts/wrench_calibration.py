@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from util.rosbag_reader import AnyReader, typestore
+from data_processing.rosbag_reader import AnyReader, typestore
 
 TOPIC_NAME = "/rokubi/wrench"
 BAG_PATH = Path("~/Downloads/bota_bag_test_wo_gripper").expanduser()

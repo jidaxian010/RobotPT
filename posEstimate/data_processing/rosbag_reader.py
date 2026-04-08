@@ -7,8 +7,89 @@ import cv2
 
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import get_typestore, Stores
+from scipy.spatial.transform import Rotation as ScipyRotation
 
 typestore = get_typestore(Stores.LATEST)
+
+
+def read_pose_stamped_from_bag(bag_path, topic, crop_start_s=None, crop_end_s=None):
+    """
+    Read a PoseStamped topic from a rosbag and return poses + timestamps.
+
+    Args:
+        bag_path     : path to the rosbag
+        topic        : ROS topic name (PoseStamped, position in metres)
+        crop_start_s : keep poses with t_rel >= crop_start_s  (None = no trim)
+        crop_end_s   : keep poses with t_rel <= crop_end_s    (None = no trim)
+
+    Returns:
+        poses      : List[dict] with keys
+                       "position"  : np.ndarray (3,) in mm  (camera frame)
+                       "rotation"  : np.ndarray (3,3)
+                       "frame_idx" : int
+        timestamps : List[float] — ROS stamp in seconds
+    """
+    bag_path = Path(bag_path)
+    poses = []
+    timestamps = []
+
+    with AnyReader([bag_path], default_typestore=typestore) as reader:
+        conn = None
+        for c in reader.connections:
+            if c.topic == topic:
+                conn = c
+                break
+        if conn is None:
+            raise RuntimeError(
+                f"Topic {topic!r} not found in {bag_path}.\n"
+                f"Available topics: {[c.topic for c in reader.connections]}"
+            )
+
+        frame_idx = 0
+        t_bag_start = None
+
+        for _, ts, raw in reader.messages(connections=[conn]):
+            msg = typestore.deserialize_cdr(raw, conn.msgtype)
+            t = RosbagReader.get_stamp_sec(msg, ts)
+
+            if t_bag_start is None:
+                t_bag_start = t
+
+            t_rel = t - t_bag_start
+            if crop_start_s is not None and t_rel < crop_start_s:
+                continue
+            if crop_end_s is not None and t_rel > crop_end_s:
+                continue
+
+            try:
+                p = msg.pose.position
+                q = msg.pose.orientation
+            except AttributeError:
+                p = msg.position
+                q = msg.orientation
+
+            position_mm = np.array([p.x, p.y, p.z], dtype=np.float64) * 1000.0
+            quat = np.array([q.x, q.y, q.z, q.w], dtype=np.float64)
+            rotation = ScipyRotation.from_quat(quat).as_matrix()
+
+            poses.append({
+                "position": position_mm,
+                "rotation": rotation,
+                "frame_idx": frame_idx,
+            })
+            timestamps.append(t)
+            frame_idx += 1
+
+    if not poses:
+        raise RuntimeError(f"No messages read from {topic!r}")
+
+    crop_info = (
+        f"crop=[{crop_start_s}s, {crop_end_s}s]"
+        if (crop_start_s is not None or crop_end_s is not None)
+        else "no crop"
+    )
+    print(f"Read {len(poses)} poses from {topic!r} ({crop_info})")
+    return poses, timestamps
 
 
 class RosbagReader:
