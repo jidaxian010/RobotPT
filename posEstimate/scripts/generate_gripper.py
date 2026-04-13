@@ -18,17 +18,17 @@ from data_processing.mocap_process import MocapGripperPoseProcessor
 # --- 1. USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME = "p9-c1-g"
+DATA_NAME = "p8-c2-g"
 DATA_DIR  = Path(__file__).resolve().parents[1] / "data"
 BAG_PATH  = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 
-CROP_START_S = 28  # seconds from bag start, or None to keep from beginning
-CROP_END_S   = 33.5  # seconds from bag start, or None to keep to end
+CROP_START_S = 47  # seconds from bag start, or None to keep from beginning
+CROP_END_S   = 68  # seconds from bag start, or None to keep to end
 
 SHOW_IMAGE = True
 SMOOTH_GRIPPER_POSE = True
 SMOOTH_MED_KERNEL = 5   # odd, frames
-SMOOTH_SIGMA = 5        # frames
+SMOOTH_SIGMA = 15        # frames
 
 
 # ==========================================

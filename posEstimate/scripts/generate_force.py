@@ -17,7 +17,7 @@ from data_processing.wrench_calibration import WrenchCalibrator
 # --- 1. USER CONFIGURATION ---
 # ==========================================
 
-DATA_NAME      = "p6-a2-w"
+DATA_NAME      = "p8-c2-w"
 BAG_PATH       = Path(f"~/Downloads/{DATA_NAME}").expanduser()
 DATA_DIR       = Path(__file__).resolve().parents[1] / "data"
 CALIB_BAG_PATH = Path("~/Downloads/bota_bag_test_wo_gripper").expanduser()

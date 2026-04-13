@@ -125,6 +125,44 @@ class MocapGripperPoseProcessor:
         print(f"  Saved gripper 6D motion in initial gripper frame: {csv_path}")
         return csv_path
 
+    def get_pose_arrays(self):
+        """
+        Return gripper trajectory in the initial gripper frame as numpy arrays.
+
+        Returns
+        -------
+        times_s   : np.ndarray (N,)  — seconds relative to first valid pose
+        pos_mm    : np.ndarray (N,3) — position in mm  (initial gripper frame)
+        euler_rad : np.ndarray (N,3) — XYZ Euler angles in rad
+        """
+        valid = [(i, p) for i, p in enumerate(self.gripper_poses) if p is not None]
+        if not valid:
+            return np.empty(0), np.empty((0, 3)), np.empty((0, 3))
+
+        _, first = valid[0]
+        R0  = first["rotation"]
+        t0  = first["position"]
+        ts0 = float(self.timestamps[first["frame_idx"]])
+
+        times, positions, eulers = [], [], []
+        first_valid_idx = valid[0][0]
+        for idx, pose in valid:
+            ts    = float(self.timestamps[pose["frame_idx"]]) - ts0
+            pos   = R0.T @ (pose["position"] - t0)
+            R_rel = R0.T @ pose["rotation"]
+            euler = ScipyRotation.from_matrix(R_rel).as_euler("xyz")
+
+            if idx == first_valid_idx:
+                ts    = 0.0
+                pos   = np.zeros(3, dtype=np.float64)
+                euler = np.zeros(3, dtype=np.float64)
+
+            times.append(ts)
+            positions.append(pos)
+            eulers.append(euler)
+
+        return np.array(times), np.array(positions), np.array(eulers)
+
     def plot_results(self):
         if not self.show_image:
             print("Skipping plots (SHOW_IMAGE=False).")

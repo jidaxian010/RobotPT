@@ -14,6 +14,7 @@ import numpy as np
 import qpsolvers
 from scipy.spatial.transform import Rotation as ScipyRotation, Slerp
 from scipy.interpolate import CubicSpline
+from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
 
 import sys
@@ -37,10 +38,10 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
-DATA_NAME  = "p9-c1-g"  # for default CSV path; edit one value here
-MOTION   = "b"     # "a" or "b": initial arm configuration
+DATA_NAME  = "p8-c2-g"  # for default CSV path; edit one value here
+MOTION   = "c"     # "a" or "c": initial arm configuration
 RUN_MODE = "once"  # "loop" or "once"
-TIME_SCALE = 0.5  # < 1.0 slows replay; 1.0 = original recorded speed
+TIME_SCALE = 1.0  # < 1.0 slows replay; 1.0 = original recorded speed
 
 
 EE_NAME      = "link8"
@@ -51,7 +52,8 @@ ROOT_JOINT   = None
 SOLVER_HZ = 200.0  # IK solver frequency (higher = smoother tracking)
 REPARAMETRIZE = True  # arc-length reparametrization for uniform speed
 
-
+# INITIAL_POSE = [5, 95, 84, -122, -87, -85, 37]  # a
+INITIAL_POSE = [97, 107,-28, -105, 89, -88, -77]  # c
 
 # Map recorded gripper-frame data into the simulator EE frame:
 # gripper +y -> EE +x
@@ -82,7 +84,9 @@ _DEFAULT_CSV = str(_REPO_ROOT / "posEstimate" / "data" / DATA_NAME / f"{DATA_NAM
 JOINT_TRAJ_OUT = None  # None -> save in same folder as _DEFAULT_CSV
 PLOT_SAVED_JOINT_TRAJ = True
 WARMUP_SKIP_SEC = 0.3  # in RUN_MODE="once", don't save the first N seconds of replay
-TRJ_HZ = 50.0  # output .trj frequency (frames are dropped/interpolated from solver Hz)
+TRJ_HZ = 200.0        # output .trj frequency
+TRJ_CUTOFF_HZ = 1.0  # Butterworth low-pass cutoff (lower = smoother)
+TRJ_FILTER_ORDER = 6  # Butterworth filter order
 
 # ── Start configuration ──────────────────────────────────────────────────────
 # Two ways to define where the robot's EE starts before replaying the trajectory:
@@ -176,8 +180,14 @@ def save_joint_trajectory_csv(csv_path, records):
     return csv_path
 
 
-def save_trj(trj_path, records, target_hz=50.0):
-    """Save solved joint trajectory as a .trj file, resampled to target_hz."""
+def save_trj(trj_path, records, target_hz=200.0, cutoff_hz=1.0, filter_order=6):
+    """
+    Save solved joint trajectory as a .trj file.
+
+    Pipeline:
+      1. Cubic-spline interpolation to target_hz.
+      2. Zero-phase Butterworth low-pass filter to remove solver-rate jitter.
+    """
     if not records:
         print("No solved joint trajectory records to save.")
         return None
@@ -190,13 +200,21 @@ def save_trj(trj_path, records, target_hz=50.0):
         print("Warning: zero-duration trajectory, skipping .trj save.")
         return None
 
+    # --- cubic spline interpolation ---
     n_frames = int(duration * target_hz) + 1
     t_new = np.linspace(t_arr[0], t_arr[-1], n_frames)
-
     n_joints = q_arr.shape[1]
     q_new = np.zeros((n_frames, n_joints))
     for j in range(n_joints):
-        q_new[:, j] = np.interp(t_new, t_arr, q_arr[:, j])
+        cs = CubicSpline(t_arr, q_arr[:, j], bc_type="clamped")
+        q_new[:, j] = cs(t_new)
+
+    # --- Butterworth low-pass filter (zero-phase) ---
+    nyquist = target_hz / 2.0
+    normalized_cutoff = cutoff_hz / nyquist
+    b, a = butter(filter_order, normalized_cutoff, btype="low", analog=False)
+    for j in range(n_joints):
+        q_new[:, j] = filtfilt(b, a, q_new[:, j])
 
     actual_hz = (n_frames - 1) / duration
 
@@ -211,7 +229,10 @@ def save_trj(trj_path, records, target_hz=50.0):
             line = " ".join(f"{v:.6f}" for v in row) + " ,"
             f.write(line + "\n")
 
-    print(f"Saved .trj: {trj_path}  ({n_frames} frames @ {actual_hz:.3f} Hz)")
+    print(
+        f"Saved .trj: {trj_path}  "
+        f"({n_frames} frames @ {actual_hz:.3f} Hz, cutoff={cutoff_hz} Hz)"
+    )
     return trj_path
 
 
@@ -350,23 +371,40 @@ if __name__ == "__main__":
         #     joint1=d2r(-38.38), joint2=d2r(142.08), joint3=d2r(0.0), joint4=d2r(-119.18),
         #     joint5=d2r(-30.94), joint6=d2r(63.03), joint7=d2r(17.76),
         # )
+        # q_ref = custom_configuration_vector(
+        #     robot,
+        #     joint1=d2r(4.9), joint2=d2r(156.2), joint3=d2r(40.0), joint4=d2r(-107.2),
+        #     joint5=d2r(-19.3), joint6=d2r(-56.1), joint7=d2r(-35.2),
+        # )
         q_ref = custom_configuration_vector(
             robot,
-            joint1=d2r(4.9), joint2=d2r(156.2), joint3=d2r(40.0), joint4=d2r(-107.2),
-            joint5=d2r(-19.3), joint6=d2r(-56.1), joint7=d2r(-35.2),
+            joint1=d2r(INITIAL_POSE[0]), joint2=d2r(INITIAL_POSE[1]),
+            joint3=d2r(INITIAL_POSE[2]), joint4=d2r(INITIAL_POSE[3]),
+            joint5=d2r(INITIAL_POSE[4]), joint6=d2r(INITIAL_POSE[5]),
+            joint7=d2r(INITIAL_POSE[6]),
         )
-    else:  # "b"
+
+    else:  # "c"
         # q_ref = custom_configuration_vector(
         #     robot,
         #     joint1=d2r(63.4), joint2=d2r(132.3), joint3=d2r(25.7), joint4=d2r(-86.3),
         #     joint5=d2r(66.8), joint6=d2r(-80.5), joint7=d2r(-35.6),
         # )
         
-        # "c"
+        # # "c" standard
+        # q_ref = custom_configuration_vector(
+        #     robot,
+        #     joint1=d2r(67.2), joint2=d2r(132.3), joint3=d2r(25.7), joint4=d2r(-86.3),
+        #     joint5=d2r(30.5), joint6=d2r(-65.0), joint7=d2r(-25.0),
+        # )
+        
+        # "c" participant
         q_ref = custom_configuration_vector(
             robot,
-            joint1=d2r(67.2), joint2=d2r(132.3), joint3=d2r(25.7), joint4=d2r(-86.3),
-            joint5=d2r(30.5), joint6=d2r(-65.0), joint7=d2r(-25.0),
+            joint1=d2r(INITIAL_POSE[0]), joint2=d2r(INITIAL_POSE[1]),
+            joint3=d2r(INITIAL_POSE[2]), joint4=d2r(INITIAL_POSE[3]),
+            joint5=d2r(INITIAL_POSE[4]), joint6=d2r(INITIAL_POSE[5]),
+            joint7=d2r(INITIAL_POSE[6]),
         )
     
     
@@ -545,7 +583,8 @@ if __name__ == "__main__":
         print_joint_trajectory_debug(solved_joint_records, q_init_for_debug, n=8)
         save_joint_trajectory_csv(out_path, solved_joint_records)
         trj_path = default_save_dir / f"{Path(PATH_TO_POSES).stem}.trj"
-        save_trj(trj_path, solved_joint_records, target_hz=TRJ_HZ)
+        save_trj(trj_path, solved_joint_records, target_hz=TRJ_HZ,
+                 cutoff_hz=TRJ_CUTOFF_HZ, filter_order=TRJ_FILTER_ORDER)
         if PLOT_SAVED_JOINT_TRAJ:
             plot_joint_trajectory(solved_joint_records)
             plot_ee_trajectory(solved_joint_records)

@@ -4,12 +4,45 @@ import json
 import bisect
 from collections import defaultdict
 import cv2
+import yaml
 
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import get_typestore, Stores
 from scipy.spatial.transform import Rotation as ScipyRotation
 
 typestore = get_typestore(Stores.LATEST)
+
+# Extension → rosbags storage plugin name
+_EXT_TO_STORAGE = {".db3": "sqlite3", ".mcap": "mcap"}
+
+
+def fix_bag_storage_id(bag_path: Path) -> None:
+    """
+    If a ROS2 bag's metadata.yaml has an empty storage_identifier, infer it
+    from the data-file extension and patch the file in-place.
+    """
+    bag_path = Path(bag_path)
+    if not bag_path.is_dir():
+        return  # ROS1 .bag file — nothing to do
+    meta_file = bag_path / "metadata.yaml"
+    if not meta_file.exists():
+        return
+
+    with open(meta_file) as f:
+        meta = yaml.safe_load(f)
+
+    info = meta.get("rosbag2_bagfile_information", {})
+    if info.get("storage_identifier", ""):
+        return  # already set
+
+    # Infer from the first relative data file
+    for rel in info.get("relative_file_paths", []):
+        ext = Path(rel).suffix.lower()
+        if ext in _EXT_TO_STORAGE:
+            info["storage_identifier"] = _EXT_TO_STORAGE[ext]
+            with open(meta_file, "w") as f:
+                yaml.dump(meta, f, default_flow_style=False, allow_unicode=True)
+            return
 
 
 def read_pose_stamped_from_bag(bag_path, topic, crop_start_s=None, crop_end_s=None):

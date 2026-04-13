@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 # Easier naming (edit one value)
-DATA_NAME = "p6-a2-g"
+DATA_NAME = "p6-c1-g"
 
 def csv_to_trj(input_csv, output_trj, original_hz=200, target_hz=1000, cutoff_hz=50, filter_order=4):
     """

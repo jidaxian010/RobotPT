@@ -1,12 +1,19 @@
 from ahrs.filters import Madgwick
 import numpy as np
 from scipy.spatial.transform import Rotation
-import sys
-from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from util import quaternion_to_rotation_matrix, quaternion_to_euler
+
+def quaternion_to_rotation_matrix(quaternions):
+    """Convert [w, x, y, z] quaternions to rotation matrices."""
+    # scipy expects [x, y, z, w]
+    q = np.asarray(quaternions)
+    return Rotation.from_quat(q[:, [1, 2, 3, 0]]).as_matrix()
+
+
+def quaternion_to_euler(quaternions):
+    """Convert [w, x, y, z] quaternions to euler angles (roll/pitch/yaw, degrees)."""
+    q = np.asarray(quaternions)
+    return Rotation.from_quat(q[:, [1, 2, 3, 0]]).as_euler("xyz", degrees=True)
 """
 Input: gyro_object
 Output: orientation
