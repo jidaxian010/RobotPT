@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as ScipyRotation
+import yaml
 
 sys.path = [p for p in sys.path if '/python3.10/' not in p] + \
            [p for p in sys.path if '/python3.10/' in p]
@@ -32,8 +33,10 @@ TRJ_NAMES = ["p9-a2-g1", "p9-a2-g2", "p9-a2-g3"]   # <-- add/remove entries here
 DATA_DIR  = Path(__file__).resolve().parents[1] / "data"
 DATA_NAME = "p9-a2-g"          # <-- change this (or set to None to skip)
 TRJ_PATH  = DATA_DIR / DATA_NAME / f"{DATA_NAME}.trj" if DATA_NAME else None
+FORCE_RULE_PATH = DATA_DIR / DATA_NAME / "force_rule.yaml" if DATA_NAME else None
 
 TOPIC_JOINT_STATES = "/optimo/joint_states"
+TOPIC_EXT_WRENCH_EE = "/optimo/safety_monitor/ext_wrench_ee"
 
 JOINT_LABELS = ["q1", "q2", "q3", "q4", "q5", "q6", "q7"]
 
@@ -79,8 +82,8 @@ def _stamp_sec(msg, fallback_ns):
 
 
 def read_joint_states(bag_path, topic):
-    """Return (timestamps, joint_names, positions [rad]) sorted by joint number."""
-    times, positions, names = [], [], None
+    """Return (timestamps, joint_names, positions [rad], t0_abs) sorted by joint number."""
+    times_abs, positions, names = [], [], None
 
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         conns = [c for c in reader.connections if c.topic == topic]
@@ -93,10 +96,10 @@ def read_joint_states(bag_path, topic):
             t = _stamp_sec(msg, ts)
             if names is None:
                 names = list(msg.name)
-            times.append(t)
+            times_abs.append(t)
             positions.append(list(msg.position))
 
-    if not times:
+    if not times_abs:
         raise RuntimeError(f"No messages in {topic!r}")
 
     import re
@@ -107,12 +110,44 @@ def read_joint_states(bag_path, topic):
     sorted_idx = sorted(range(len(names)), key=lambda i: _joint_key(names[i]))
     names = [names[i] for i in sorted_idx]
 
-    times = np.array(times)
-    times -= times[0]
+    times_abs = np.array(times_abs)
+    t0_abs = float(times_abs[0])
+    times = times_abs - t0_abs
     positions = np.array(positions)[:, sorted_idx]
 
     print(f"[joint_states] {len(times)} msgs, {len(names)} joints: {names}")
-    return times, names, positions
+    return times, names, positions, t0_abs
+
+
+def read_ext_wrench_ee(bag_path, topic, t0_abs=None):
+    """Return (timestamps, wrench [Fx,Fy,Fz,Tx,Ty,Tz]) with optional alignment to t0_abs."""
+    times_abs, wrench = [], []
+
+    with AnyReader([bag_path], default_typestore=typestore) as reader:
+        conns = [c for c in reader.connections if c.topic == topic]
+        if not conns:
+            available = [c.topic for c in reader.connections]
+            raise RuntimeError(f"Topic {topic!r} not found.\nAvailable: {available}")
+
+        for conn, ts, raw in reader.messages(connections=conns):
+            msg = typestore.deserialize_cdr(raw, conn.msgtype)
+            t = _stamp_sec(msg, ts)
+            f = msg.wrench.force
+            tor = msg.wrench.torque
+            times_abs.append(t)
+            wrench.append([f.x, f.y, f.z, tor.x, tor.y, tor.z])
+
+    if not times_abs:
+        raise RuntimeError(f"No messages in {topic!r}")
+
+    times_abs = np.array(times_abs)
+    if t0_abs is None:
+        t0_abs = float(times_abs[0])
+    times = times_abs - t0_abs
+    wrench = np.array(wrench)
+
+    print(f"[ext_wrench_ee] {len(times)} msgs from {topic}")
+    return times, wrench
 
 
 
@@ -180,6 +215,20 @@ def parse_trj(path: Path):
     return t, data
 
 
+def load_force_rules(path: Path):
+    """Load force min/max from force_rule.yaml. Returns dict or None."""
+    if path is None or not path.exists():
+        print(f"Warning: FORCE_RULE_PATH not found: {path}")
+        return None
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+    force_rules = doc.get("force_N", None) if isinstance(doc, dict) else None
+    if force_rules is None:
+        print(f"Warning: no force_N in rulebook: {path}")
+        return None
+    return force_rules
+
+
 # ==========================================
 # --- 3. PLOTTING ---
 # ==========================================
@@ -216,11 +265,11 @@ def plot_joint_states(bags, names, trj_times=None, trj_data=None):
     for i, ax in enumerate(axes):
         joint_label = names[i] if i < len(names) else f"joint_{i+1}"
 
-        ax.plot(t_common, mean_pos[:, i], linewidth=1.4, label="actual trajectory", color="C0")
+        ax.plot(t_common, mean_pos[:, i], linewidth=1.4, label="actual trajectory", color="red")
         ax.fill_between(t_common,
                         mean_pos[:, i] - std_pos[:, i],
                         mean_pos[:, i] + std_pos[:, i],
-                        alpha=0.3, color="C0", label="±std")
+                        alpha=0.3, color="red", label="±std")
 
         if trj_times is not None and trj_data is not None and i < trj_data.shape[1]:
             ax.plot(trj_times, np.degrees(trj_data[:, i]),
@@ -290,6 +339,57 @@ def plot_ee_comparison(bags_ee, gt_gripper=None):
     fig.tight_layout()
 
 
+def plot_ext_wrench_ee(bags_wrench, force_rules=None, danger_tol_n=20.0):
+    """
+    3 subplots (Fx, Fy, Fz) — mean ± std across bags.
+    bags_wrench: list of (label, times, wrench) — wrench in EE frame
+    """
+    labels = ["Fx", "Fy", "Fz"]
+    units  = ["N", "N", "N"]
+    axis_keys = ["x", "y", "z"]
+
+    t_end    = min(b[1][-1] for b in bags_wrench)
+    n_pts    = max(len(b[1]) for b in bags_wrench)
+    t_common = np.linspace(0, t_end, n_pts)
+
+    wrench_all = np.stack([
+        np.column_stack([np.interp(t_common, t, w[:, j]) for j in range(3)])
+        for _, t, w in bags_wrench
+    ])  # (n_bags, n_pts, 3)
+
+    mean_w, std_w = wrench_all.mean(axis=0), wrench_all.std(axis=0)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 2.2 * 3), sharex=True)
+    for i in range(3):
+        ax = axes[i]
+        ax.plot(t_common, mean_w[:, i], linewidth=1.4, color="green",
+                label="actual force")
+        ax.fill_between(t_common, mean_w[:, i] - std_w[:, i],
+                        mean_w[:, i] + std_w[:, i],
+                        alpha=0.3, color="green", label="±std")
+
+        if force_rules is not None:
+            rule = force_rules.get(axis_keys[i], None)
+            if rule is not None:
+                warn_min = float(rule["min"])
+                warn_max = float(rule["max"])
+                danger_min = warn_min - danger_tol_n
+                danger_max = warn_max + danger_tol_n
+                ax.axhline(warn_min, linestyle="--", color="black", linewidth=1.0,
+                           label="warning min/max")
+                ax.axhline(warn_max, linestyle="--", color="black", linewidth=1.0)
+                ax.axhline(danger_min, linestyle="-.", color="black", linewidth=1.0,
+                           label=f"danger min/max")
+                ax.axhline(danger_max, linestyle="-.", color="black", linewidth=1.0)
+
+        ax.set_ylabel(f"{labels[i]}\n({units[i]})", fontsize=8)
+        ax.legend(fontsize=7, loc="upper right")
+        ax.grid(False)
+
+    axes[-1].set_xlabel("Time (s)")
+    fig.tight_layout()
+
+
 # ==========================================
 # --- 4. MAIN ---
 # ==========================================
@@ -301,6 +401,7 @@ def main():
             print(f"Warning: TRJ_PATH not found: {TRJ_PATH}")
         else:
             trj_times, trj_data = parse_trj(TRJ_PATH)
+    force_rules = load_force_rules(FORCE_RULE_PATH)
 
     # --- MoCap ground-truth gripper pose (from DATA_NAME bag) ---
     gt_gripper = None   # (times_s, pos_mm, euler_rad)
@@ -326,12 +427,14 @@ def main():
 
     bags_joint  = []   # (label, times, positions) — for joint plot
     bags_ee     = []   # (label, times, pos_mm, euler_deg) — FK EE in initial EE frame
+    bags_wrench = []   # (label, times, wrench) — ext_wrench_ee plot
     first_names = None
 
     for name in TRJ_NAMES:
         bag_path = Path(f"~/Downloads/{name}").expanduser()
         print(f"\nReading bag: {bag_path}")
-        times_j, names, positions = read_joint_states(bag_path, TOPIC_JOINT_STATES)
+        times_j, names, positions, t0_abs = read_joint_states(bag_path, TOPIC_JOINT_STATES)
+        times_w, wrench = read_ext_wrench_ee(bag_path, TOPIC_EXT_WRENCH_EE, t0_abs=t0_abs)
 
         if first_names is None:
             first_names = names
@@ -345,17 +448,24 @@ def main():
             times_j_plot   = times_j[mask_j] - t1
             positions_plot = positions[mask_j]
             trj_times_plot = trj_times_aligned - t1
+
+            mask_w = (times_w >= t1) & (times_w <= t2)
+            times_w_plot = times_w[mask_w] - t1
+            wrench_plot  = wrench[mask_w]
         else:
             times_j_plot, positions_plot = times_j, positions
             trj_times_plot = None
+            times_w_plot, wrench_plot = times_w, wrench
 
         bags_joint.append((name, times_j_plot, positions_plot))
+        bags_wrench.append((name, times_w_plot, wrench_plot))
 
         pos_mm, euler_deg = compute_ee_in_initial_frame(robot, frame_id, positions_plot)
         bags_ee.append((name, times_j_plot, pos_mm, euler_deg))
 
     plot_joint_states(bags_joint, first_names, trj_times_plot, trj_data)
     plot_ee_comparison(bags_ee, gt_gripper)
+    plot_ext_wrench_ee(bags_wrench, force_rules=force_rules)
 
     plt.show()
 
